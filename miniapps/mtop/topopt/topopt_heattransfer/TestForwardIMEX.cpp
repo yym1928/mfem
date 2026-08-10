@@ -20,7 +20,7 @@ void velocity_function(const Vector &x, Vector &v)
       real_t center = (bb_min[i] + bb_max[i]) * 0.5;
       X(i) = 2 * (x(i) - center) / (bb_max[i] - bb_min[i]);
    }
-   switch (problem)
+   switch (problem) 
    {
       case 0:
       {
@@ -119,83 +119,83 @@ real_t u0_function(const Vector &x)
    return 0.0;
 }
 
-class Implicit_Solver : public Solver
-{
-private:
-   HypreParMatrix &M, &S;
-   HypreParMatrix *A;
-   CGSolver linear_solver;
-   real_t dt;
-   SparseMatrix M_diag;
-public:
-   Implicit_Solver(HypreParMatrix &M_, HypreParMatrix &S_,
-                   const FiniteElementSpace &fes)
-      : M(M_),
-        S(S_),
-        A(nullptr),
-        linear_solver(M.GetComm()),
-        dt(1.0)
-   {
-      linear_solver.iterative_mode = false;
-      linear_solver.SetRelTol(1e-9);
-      linear_solver.SetAbsTol(0.0);
-      linear_solver.SetMaxIter(100);
-      linear_solver.SetPrintLevel(0);
+// class Implicit_Solver : public Solver
+// {
+// private:
+//    HypreParMatrix &M, &S;
+//    HypreParMatrix *A;
+//    CGSolver linear_solver;
+//    real_t dt;
+//    SparseMatrix M_diag;
+// public:
+//    Implicit_Solver(HypreParMatrix &M_, HypreParMatrix &S_,
+//                    const FiniteElementSpace &fes)
+//       : M(M_),
+//         S(S_),
+//         A(nullptr),
+//         linear_solver(M.GetComm()),
+//         dt(1.0)
+//    {
+//       linear_solver.iterative_mode = false;
+//       linear_solver.SetRelTol(1e-9);
+//       linear_solver.SetAbsTol(0.0);
+//       linear_solver.SetMaxIter(100);
+//       linear_solver.SetPrintLevel(0);
 
-      M.GetDiag(M_diag);
-   }
+//       M.GetDiag(M_diag);
+//    }
 
-   void SetTimeStep(real_t dt_)
-   {
-      real_t ddt = dt-dt_;
+//    void SetTimeStep(real_t dt_)
+//    {
+//       real_t ddt = dt-dt_;
 
-      // syncronize ddt across all processes
-      MPI_Comm comm = M.GetComm();
-      int myrank;
-      MPI_Comm_rank(comm, &myrank);
-      MPI_Bcast(&ddt, 1, MPI_DOUBLE, 0, comm);
+//       // syncronize ddt across all processes
+//       MPI_Comm comm = M.GetComm();
+//       int myrank;
+//       MPI_Comm_rank(comm, &myrank);
+//       MPI_Bcast(&ddt, 1, MPI_DOUBLE, 0, comm);
 
-      real_t epsilon;
-      epsilon = std::numeric_limits<real_t>::epsilon();
-      // allow for some tolerance in the time stepping process
-      epsilon*=10;
+//       real_t epsilon;
+//       epsilon = std::numeric_limits<real_t>::epsilon();
+//       // allow for some tolerance in the time stepping process
+//       epsilon*=10;
 
-      if (fabs(ddt) > epsilon)
-      {
-         if (0==myrank)
-         {
-            cout << "Updating Implicit_Solver time step from " << dt
-                 << " to " << dt_ << endl;
-         }
+//       if (fabs(ddt) > epsilon)
+//       {
+//          if (0==myrank)
+//          {
+//             cout << "Updating Implicit_Solver time step from " << dt
+//                  << " to " << dt_ << endl;
+//          }
 
-         delete A;
-         dt = dt_;
-         // Form operator A = M + dt*S
-         A = Add(dt, S, 1.0, M);
-         linear_solver.SetOperator(*A);
-      }
-   }
+//          delete A;
+//          dt = dt_;
+//          // Form operator A = M + dt*S
+//          A = Add(dt, S, 1.0, M);
+//          linear_solver.SetOperator(*A);
+//       }
+//    }
 
-   void SetOperator(const Operator &op) override
-   {
-      linear_solver.SetOperator(op);
-   }
+//    void SetOperator(const Operator &op) override
+//    {
+//       linear_solver.SetOperator(op);
+//    }
 
-   void Mult(const Vector &x, Vector &y) const override
-   {
-      linear_solver.Mult(x, y);
-   }
+//    void Mult(const Vector &x, Vector &y) const override
+//    {
+//       linear_solver.Mult(x, y);
+//    }
 
-   void SetPreconditioner(Solver &precond)
-   {
-      linear_solver.SetPreconditioner(precond);
-   }
+//    void SetPreconditioner(Solver &precond)
+//    {
+//       linear_solver.SetPreconditioner(precond);
+//    }
 
-   ~Implicit_Solver() override
-   {
-      delete A;
-   }
-};
+//    ~Implicit_Solver() override
+//    {
+//       delete A;
+//    }
+// };
 
 /** A time-dependent operator for the right-hand side of the ODE. The DG weak
     form of the advection-diffusion equation is (M + dt S) du/dt = Su - K u + b
@@ -217,7 +217,7 @@ private:
 
 public:
    IMEX_Evolution(ParBilinearForm &M_, ParBilinearForm &K_, ParBilinearForm &S_,
-                  const Vector &b_, ParBilinearForm &A_);
+                  const Vector &b_, ParBilinearForm &A_, real_t dt);
 
    virtual
    ~IMEX_Evolution()
@@ -504,7 +504,7 @@ int main(int argc, char *argv[])
    // 10. Define the time-dependent evolution operator describing the
    //     ODE right-hand side, and perform time-integration (looping
    //     over the time iterations, ti, with a time-step dt).
-   IMEX_Evolution adv(*m, *k, *s, b, *a);
+   IMEX_Evolution adv(*m, *k, *s, b, *a, dt);
 
    real_t t = 0.0;
    adv.SetTime(t);
@@ -515,7 +515,7 @@ int main(int argc, char *argv[])
    for (int ti = 0; !done; )
    {
       real_t dt_real = min(dt, t_final - t);
-      ode_solver->Step(*U, t, dt_real);
+      ode_solver->Step(*U, t, dt_real);  
       ti++;
 
       done = (t >= t_final - 1e-8*dt);
@@ -541,6 +541,8 @@ int main(int argc, char *argv[])
       }
    }
 
+   ode_solver->AdjointStep(*U, *U, t, dt);  
+
    // 11. Free the used memory.
    delete pd;
    delete U;
@@ -558,7 +560,7 @@ int main(int argc, char *argv[])
 
 // Implementation of class IMEX_Evolution
 IMEX_Evolution::IMEX_Evolution(ParBilinearForm &M_, ParBilinearForm &K_,
-                               ParBilinearForm &S_, const Vector &b_, ParBilinearForm &A_)
+                               ParBilinearForm &S_, const Vector &b_, ParBilinearForm &A_, real_t dt)
    : TimeDependentOperator(M_.ParFESpace()->GetTrueVSize()), b(b_),
      M_solver(M_.ParFESpace()->GetComm()), z(height), w(height)
 {
@@ -585,12 +587,12 @@ IMEX_Evolution::IMEX_Evolution(ParBilinearForm &M_, ParBilinearForm &K_,
       HypreParMatrix &S_mat = *S.As<HypreParMatrix>();
       HypreSmoother *hypre_prec = new HypreSmoother(M_mat, HypreSmoother::Jacobi);
       M_prec = hypre_prec;
-
-      implicit_solver = new Implicit_Solver(M_mat, S_mat, *M_.FESpace());
+      MPI_Comm comm = M_mat.GetComm();
+      implicit_solver = new Implicit_Solver(M_mat, S_mat, *M_.ParFESpace(), dt, comm);
       lor_solver = new LORSolver<HypreBoomerAMG>(A_, ess_tdof_list);
       lor_solver->GetSolver().SetSystemsOptions(A_.ParFESpace()->GetVDim(), true);
       lor_solver->GetSolver().SetPrintLevel(-1);
-      implicit_solver -> SetPreconditioner(*lor_solver);
+      implicit_solver -> SetPreconditioner(*lor_solver); 
    }
    else
    {

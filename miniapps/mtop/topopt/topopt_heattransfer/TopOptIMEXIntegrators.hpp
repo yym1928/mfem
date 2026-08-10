@@ -10,6 +10,7 @@
 #include "ObjFunc.hpp"     // TimeIntegratedObjective (J, dJ/du)
 #include "HeatTransferLinForms.hpp"
 #include "HeatTransferTopOpt.hpp"
+#include "HeatTransferSolvers.hpp"
 #include "../../pde_filter.hpp"
 
 
@@ -28,12 +29,13 @@ protected:
     std::vector<Vector> ks_imp;
     std::vector<Vector> dks_ex;
     std::vector<Vector> dks_imp;
+    std::vector<Vector> x_stages; // for adjoint computation
     Vector k;
     Vector y; // helper
 public:
     void SetButcherTable(mfem::Array2D<real_t> &A_ex_, mfem::Array2D<real_t> &A_imp_, Vector &b_ex_, Vector &b_imp_);
     void Init(TimeDependentOperator &f_) override;
-    // void AdjointStep(Vector &lam, real_t &t, real_t &dt, Vector &x) = 0;
+    void AdjointStep(Vector &lam, Vector &x, real_t &t, real_t &dt);
     void Step(Vector &x, real_t &t, real_t &dt) override;
     static MFEM_EXPORT std::unique_ptr<TopOptRKIMEXSolver> SelectTopOptRKIMEX(const int ode_solver_type);
 };
@@ -65,14 +67,14 @@ void TopOptRKIMEXSolver::Step(Vector &x, real_t &t, real_t &dt)
    f->Mult(x, k);
    Vector x_old = x;
    ks_ex.push_back(k);
-   if(Mpi::Root()){std::cout<<"x norm = " << x.Norml2() << std::endl;}
+   // if(Mpi::Root()){std::cout<<"x norm = " << x.Norml2() << std::endl;}
    x.Add(dt*b_ex(0), ks_ex[0]);
-   if(Mpi::Root()){std::cout<<"ks_ex 0 norm = " << ks_ex[0].Norml2() << std::endl;}
-   if(Mpi::Root()){std::cout<<"x norm = " << x.Norml2() << std::endl;}
+   // if(Mpi::Root()){std::cout<<"ks_ex 0 norm = " << ks_ex[0].Norml2() << std::endl;}
+   // if(Mpi::Root()){std::cout<<"x norm = " << x.Norml2() << std::endl;}
 
    for (int stage = 0; stage < num_stages; stage++)
    {
-      f->SetTime(t+dt);
+      f->SetTime(t+A_imp(stage, stage)*dt);
       y = x_old;
       for (int j = 0; j < stage; j++)
       {
@@ -80,23 +82,66 @@ void TopOptRKIMEXSolver::Step(Vector &x, real_t &t, real_t &dt)
          y.Add(dt*A_imp(stage, j), ks_imp[j]); 
       }
       y.Add(dt*A_ex(stage+1, stage), ks_ex[stage]);
-      if(Mpi::Root()){std::cout<<"y pre computation norm = " << y.Norml2() << std::endl;}
+      // if(Mpi::Root()){std::cout<<"y pre computation norm = " << y.Norml2() << std::endl;}
       f->SetEvalMode(TimeDependentOperator::ADDITIVE_TERM_2);
-      f->ImplicitSolve(dt, y, k);
+      f->ImplicitSolve(A_imp(stage, stage)*dt, y, k);
       ks_imp.push_back(k);
-      if(Mpi::Root()){std::cout<<"k_imp 0 norm = " << ks_imp[stage].Norml2() << std::endl;}
+      // if(Mpi::Root()){std::cout<<"k_imp 0 norm = " << ks_imp[stage].Norml2() << std::endl;}
       y.Add(dt*A_imp(stage, stage), ks_imp[stage]);
       f->SetTime(t);
       f->SetEvalMode(TimeDependentOperator::ADDITIVE_TERM_1);
       f->Mult(y, k);
       ks_ex.push_back(k);
       x.Add(dt*b_ex(stage+1), ks_ex[stage+1]);
-      if(Mpi::Root()){std::cout<<"k_ex 1 norm = " << ks_ex[stage+1].Norml2() << std::endl;}
-      if(Mpi::Root()){std::cout<<"x norm = " << x.Norml2() << std::endl;}
+      // if(Mpi::Root()){std::cout<<"k_ex 1 norm = " << ks_ex[stage+1].Norml2() << std::endl;}
+      // if(Mpi::Root()){std::cout<<"x norm = " << x.Norml2() << std::endl;}
       x.Add(dt*b_imp(stage), ks_imp[stage]);
-      if(Mpi::Root()){std::cout<<"x norm = " << x.Norml2() << std::endl;}
+      // if(Mpi::Root()){std::cout<<"x norm = " << x.Norml2() << std::endl;}
    }
+   ks_ex.clear();
+   ks_imp.clear();
+   // if(Mpi::Root()){std::cout<<"================================================="  << std::endl;}
    t += dt;
+}
+
+void TopOptRKIMEXSolver::AdjointStep(Vector &lam, Vector &x, real_t &t, real_t &dt)
+{
+   if (IMEXAdvectionDiffusionSolver* imex_ptr = dynamic_cast<IMEXAdvectionDiffusionSolver*>(f))
+   {
+      f->SetTime(t);
+      f->SetEvalMode(TimeDependentOperator::ADDITIVE_TERM_1);
+      f->AdjointMult(lam, k, x);
+      Vector lam_old = lam;
+      ks_ex.push_back(k);
+      lam.Add(dt*b_ex(0), ks_ex[0]);
+
+      for (int stage = 0; stage < num_stages; stage++)
+      {
+         f->SetTime(t+A_imp(stage, stage)*dt);
+         y = lam_old;
+         for (int j = 0; j < stage; j++)
+         {
+            y.Add(dt*A_ex(stage+1, j), ks_ex[j]);
+            y.Add(dt*A_imp(stage, j), ks_imp[j]); 
+         }
+         y.Add(dt*A_ex(stage+1, stage), ks_ex[stage]);
+         f->SetEvalMode(TimeDependentOperator::ADDITIVE_TERM_2);
+         f->AdjointImplicitSolve(A_imp(stage, stage)*dt, y, x, k);
+         ks_imp.push_back(k);
+         y.Add(dt*A_imp(stage, stage), ks_imp[stage]);
+         f->SetTime(t);
+         f->SetEvalMode(TimeDependentOperator::ADDITIVE_TERM_1);
+         f->AdjointMult(y, k, x);
+         ks_ex.push_back(k);
+         lam.Add(dt*b_ex(stage+1), ks_ex[stage+1]);
+         lam.Add(dt*b_imp(stage), ks_imp[stage]);
+      }
+      ks_ex.clear();
+      ks_imp.clear();
+      // if(Mpi::Root()){std::cout<<"================================================="  << std::endl;}
+      t += dt;  
+   }
+   else{MFEM_ABORT("TimeDependentOperator Must be an IMEXSolver!");}
 }
 
 class TopOptRKIMEXExpImplEuler : public TopOptRKIMEXSolver
