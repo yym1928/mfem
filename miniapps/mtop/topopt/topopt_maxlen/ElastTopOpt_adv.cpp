@@ -272,7 +272,7 @@ int main(int argc, char *argv[])
 
     real_t dt = cfl * hmin / (2 * order + 1);
     advect.GetSolver().SetTimeStep(dt);  // pseudo-transient time step
-    advect.GetSolver().SetTerminalTime(1.5);
+    advect.GetSolver().SetTerminalTime(2);
 
     // 7. Construct the quantity of interest objects
     Compliance comp(MPI_COMM_WORLD, &filter_fes, simp_cf, energy_cf);
@@ -411,6 +411,8 @@ int main(int argc, char *argv[])
     real_t iterationError = 1.0;
     real_t init_comp = 1.0;
 
+    const real_t ourflow_len = ray_type == 1 ? 3 : 1;
+
     // Track next iteration for epsilon decay and beta doubling
     int next_epsilon_decay = init_it;
     int next_beta_double = init_it + beta_steps;
@@ -478,9 +480,15 @@ int main(int argc, char *argv[])
         advect.ASolve();
         int aic = advect.GetSolver().GetIterCount();
         if (myid == 0)
-            mfem::out << "\nAdvection Forward: " << ic << " iterations"
-                      << "\nAdvection Backward: " << aic << " iterations" << endl;
+            mfem::out << fixed << setprecision(2)
+                      << "\nAdvection Forward: " << ic << " iterations, "
+                      << "  Terminal Time: " << ic * dt << "s"
+                      << "\nAdvection Backward: " << aic << " iterations, " 
+                      << "  Terminal Time: " << aic * dt << "s" << endl;
         filter.MultTranspose(advect.GetSensitivity(), dthick.GetBlock(0));
+
+        thickres /= ourflow_len;
+        dthick /= ourflow_len;          // normalization
 
         fival(1) = thickres / epsilon - 1.0;            // update constraint value
         dthick /= epsilon;

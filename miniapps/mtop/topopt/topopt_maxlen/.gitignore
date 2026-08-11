@@ -7,4 +7,5 @@ ElastTopOpt_adv
 ElastTopOpt_ct
 ElastTopOpt_3d
 
-checkpoints_*
+checkpoints*
+ParaView*

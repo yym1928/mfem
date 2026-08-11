@@ -399,7 +399,7 @@ int main(int argc, char *argv[])
         advect[r] = make_unique<MaterialThicknessSolver>(filter_fes, dgfes, *ray_cf[r], pa);
         advect[r]->SetMinv(minv);
         advect[r]->GetSolver().SetTimeStep(dt);      // pseudo-transient time step
-        advect[r]->GetSolver().SetTerminalTime(1.5);
+        advect[r]->GetSolver().SetTerminalTime(3);
     }
 
     // 7. Construct the quantity of interest objects
@@ -684,8 +684,8 @@ int main(int argc, char *argv[])
         // real_t vol = vol_int / domain_volume;
         // fival(0) = vol_int / Vstar - 1.0;
 
-        // (5) advect rho~ along each ray field to get the thickness measure rho_a,
-        // (6) then the max-thickness constraint and gradient per direction:
+        // (5) advect rho~ along each ray to get the thickness measure rho_a, then the
+        //     max-thickness constraint and gradient per direction:
         //       1/2 ∫(rho_a−α_r)² − ε ≤ 0
         //       dR/dalpha_r = (α_r − rho_a) on Gamma_out,r
         //       dR/drho     = M_fc^T N^T (rho_a − α_r)  via the adjoint advection solve
@@ -721,7 +721,7 @@ int main(int argc, char *argv[])
             fi_thick = std::max(fi_thick, fival(1 + r));
         }
 
-        // (7) box constraints:  rho ∈ [0,1],  α_r ∈ [alpha_min, alpha_max]  (move limits)
+        // (6) box constraints:  rho ∈ [0,1],  α_r ∈ [alpha_min, alpha_max]  (move limits)
         for (int r = 0; r < n_dir; r++) { alpha[r]->GetTrueDofs(alpha_tv[r]); }
         for (int i = 0; i < n; i++)
         {
@@ -737,7 +737,7 @@ int main(int argc, char *argv[])
             }
         }
 
-        // (8) MMA update on the stacked design  x = [ ρ ; α_0 ; ... ; α_{n_dir-1} ]
+        // (7) MMA update on the stacked design  x = [ ρ ; α_0 ; ... ; α_{n_dir-1} ]
         tx_local.GetBlock(0) = rho_tv;
         for (int r = 0; r < n_dir; r++) { tx_local.GetBlock(1 + r) = alpha_tv[r]; }
         rho_old = rho_tv;
@@ -759,7 +759,7 @@ int main(int argc, char *argv[])
         double iter_end_time = MPI_Wtime() - opt_start_time;
         double iter_runtime  = iter_end_time - iter_start_time;
 
-        // (9) reporting
+        // (8) reporting
         if (myid == 0)
         {
             const int w = 14;               // column width
@@ -793,7 +793,7 @@ int main(int argc, char *argv[])
             csv.flush();
         }
 
-        // (10) tighten the max-thickness tolerance and update beta
+        // (9) tighten the max-thickness tolerance and update beta
         // Epsilon decay: starts at init_it, then every decay_int iterations
         if (it == next_epsilon_decay)
         {

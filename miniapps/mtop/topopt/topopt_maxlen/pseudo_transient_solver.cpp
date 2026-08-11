@@ -25,22 +25,17 @@ void PseudoTransientSolver::MarchToSteadyState(LinearEvolutionOperator &evol,
     real_t t = 0.0;
     real_t rate = 2.0 * tol;
 
-    while (rate > tol || t < final_t)
+    while (rate > tol && t < final_t)
     {
-        const bool track_rate = (t >= final_t);
-
         u_prev = u;
-        real_t u_prev_norm = track_rate ? ParNormlp(u_prev, 2.0, comm) : 0.0;
+        real_t u_prev_norm = ParNormlp(u_prev, 2.0, comm);
 
         real_t step = dt;
         ode->Step(u, t, step);
         iter_count++;
 
-        if (track_rate)
-        {
-            u_prev -= u;
-            rate = ParNormlp(u_prev, 2.0, comm) / (step * (u_prev_norm + eps));
-        }
+        u_prev -= u;
+        rate = ParNormlp(u_prev, 2.0, comm) / (step * (u_prev_norm + eps));
     }
 }
 
