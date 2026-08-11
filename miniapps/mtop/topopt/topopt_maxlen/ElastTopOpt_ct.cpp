@@ -88,6 +88,7 @@ int main(int argc, char *argv[])
     real_t move         = 0.1;        // MMA move limit
     real_t epsilon      = 1e-2;       // thickness residual tolerance
     bool   pa           = false;
+    bool   cp           = false;
     bool   restart      = false;
     const int seed      = 0;
     int    ray_type = 1;              // thickness ray strategy: 1=parallel, 2=cone
@@ -135,6 +136,8 @@ int main(int argc, char *argv[])
                     "-no-vis", "--no-visualization", "enable GLVis visualization");
     args.AddOption(&pa, "-pa", "--partial-assembly", "-no-pa", "--no-partial-assembly",
                     "enable partial assembly (recommended for large problems)");
+    args.AddOption(&cp, "-cp", "--checkpoint", "-no-cp", "--no-checkpoint",
+                    "use checkpointing for the optimization");
     args.AddOption(&restart, "-restart", "--restart", "-no-restart", "--no-restart",
                     "restart from checkpoint");
     args.Parse();
@@ -311,7 +314,7 @@ int main(int argc, char *argv[])
     vector<unique_ptr<IsoLinElasticSolver>> elast(n_elast_solve);
     for (int i = 0; i < n_elast_solve; i++)
     {
-        elast[i] = make_unique<IsoLinElasticSolver>(&design_domain, order, pa);
+        elast[i] = make_unique<IsoLinElasticSolver>(&design_domain, order);
         const LoadCase &lc = prob.cases[i];
         for (int j = 0; j < lc.load_attrs.Size(); j++)
         {
@@ -720,7 +723,29 @@ int main(int argc, char *argv[])
 
             fi_thick = std::max(fi_thick, fival(1 + r));
         }
+        
+        // printing max thickness per direction 
+        for (int r = 0; r < n_dir; r++)
+        {
+            real_t local_max = advect[r]->GetRhoA().Max();
+            real_t global_max = local_max;
+            MPI_Allreduce(&local_max, &global_max, 1, MPITypeMap<real_t>::mpi_type, MPI_MAX,
+                        advect[r]->GetRhoA().ParFESpace()->GetComm());
 
+
+            real_t local_alpha_max = alpha[r]->Max();
+            real_t global_alpha_max = local_alpha_max;
+            MPI_Allreduce(&local_alpha_max, &global_alpha_max, 1, MPITypeMap<real_t>::mpi_type, MPI_MAX,
+                        alpha[r]->ParFESpace()->GetComm());
+            if (myid == 0)
+            {
+                mfem::out << "ray direction [" << r << "]"
+                        << ":    max rho_a = " << fixed << setprecision(8) << global_max 
+                        << ",    max alpha = " << fixed << setprecision(8) << global_alpha_max
+                        << ",    residual = " << scientific << setprecision(8) << fival[r+1] << endl;
+            }
+        }
+        
         // (6) box constraints:  rho ∈ [0,1],  α_r ∈ [alpha_min, alpha_max]  (move limits)
         for (int r = 0; r < n_dir; r++) { alpha[r]->GetTrueDofs(alpha_tv[r]); }
         for (int i = 0; i < n; i++)
@@ -746,7 +771,7 @@ int main(int argc, char *argv[])
         if (it == 1) { init_comp = compliance; }
         compliance /= init_comp;
         df0dx /= init_comp;
-
+        
         mma.Update(tx_local, df0dx, compliance, fival, dfidx.data(), tx_min, tx_max);
         rho.SetFromTrueDofs(tx_local.GetBlock(0));
         for (int r = 0; r < n_dir; r++) { alpha[r]->SetFromTrueDofs(tx_local.GetBlock(1 + r)); }
@@ -812,7 +837,7 @@ int main(int argc, char *argv[])
         }
 
         // Checkpoint every cp_interval iterations
-        if (it % cp_interval == 0)
+        if (cp && it % cp_interval == 0)
         {
             rho.GetTrueDofs(rho_tv);
             for (int r = 0; r < n_dir; r++) { alpha[r]->GetTrueDofs(alpha_tv[r]); }

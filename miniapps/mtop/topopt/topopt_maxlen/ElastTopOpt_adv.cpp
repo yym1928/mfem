@@ -494,6 +494,25 @@ int main(int argc, char *argv[])
         dthick /= epsilon;
         dfidx[1] = dthick;                              // update constraint gradient
 
+        {
+            real_t local_max = advect.GetRhoA().Max();
+            real_t global_max = local_max;
+            MPI_Allreduce(&local_max, &global_max, 1, MPITypeMap<real_t>::mpi_type, MPI_MAX,
+                        advect.GetRhoA().ParFESpace()->GetComm());
+
+
+            real_t local_alpha_max = alpha.Max();
+            real_t global_alpha_max = local_alpha_max;
+            MPI_Allreduce(&local_alpha_max, &global_alpha_max, 1, MPITypeMap<real_t>::mpi_type, MPI_MAX,
+                        alpha.ParFESpace()->GetComm());
+            if (myid == 0)
+            {
+                mfem::out << "max rho_a = " << fixed << setprecision(8) << global_max 
+                        << ",    max alpha = " << fixed << setprecision(8) << global_alpha_max
+                        << ",    residual = " << scientific << setprecision(8) << fival(1) << endl;
+            }
+        }
+
         // (7) box constraints:  rho ∈ [0,1],  ɑ ∈ [alpha_min, alpha_max]  (move limits)
         alpha.GetTrueDofs(alpha_tv);
         for (int i = 0; i < n; i++)

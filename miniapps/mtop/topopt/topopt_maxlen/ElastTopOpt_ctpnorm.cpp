@@ -1,10 +1,12 @@
-// Linear elasticity topology optimization with a max thickness constraint, 3D.
+// Linear elasticity topology optimization with a max thickness constraint.
 // Thickness measure is calculated by solving an advection pde, one advection
 // direction per ray angle, giving one thickness constraint per direction.
+// Each constraint aggregates the thickness measure over that direction's
+// outflow boundary with a p-norm, bounded by maxthick.
 //
-// Sample run:  mpirun -np 8 ./ElastTopOpt_3d
-//              mpirun -np 8 ./ElastTopOpt_3d -r 5 -vf 0.5
-//              mpirun -np 8 ./ElastTopOpt_3d -nd 4 -amax 0.6
+// Sample run:  mpirun -np 8 ./ElastTopOpt_ctpnorm -m "../../data/d_square_4_holes.msh" -vf 0.4 -mt 0.6 -p 8
+//              mpirun -np 8 ./ElastTopOpt_ctpnorm -m "../../data/circular_5_holes_pentagon.msh" -vf 0.4 -mt 0.6 -p 8
+//              mpirun -np 8 ./ElastTopOpt_ctpnorm -m "../../data/disk_6_holes.msh" -vf 0.4 -mt 0.6 -p 8
 
 #include "mfem.hpp"
 #include "ElastTopOpt.hpp"
@@ -22,13 +24,12 @@
 using namespace std;
 using namespace mfem;
 
-// Boundary/body data for one elasticity solve.
+// Boundary data for one elasticity solve.
 struct LoadCase
 {
     Array<int>    clamp_attrs;
-    Array<int>    load_attrs;                          // surface tractions
+    Array<int>    load_attrs;
     Array<real_t> fx, fy, fz;
-    void (*vol_load)(const Vector &, Vector &) = nullptr;   // optional body force
 };
 
 // n_dir directions evenly spaced over [start, start+span).
@@ -51,20 +52,46 @@ struct RaySpec
 // one elasticity solve per load case.
 struct MeshProblem
 {
-    Array<int>            outer_bdr_attrs;   // free surfaces: rho~ = 0 in the filter
+    Array<int>            domain_attr;
+    Array<int>            outer_bdr_attrs;
     std::vector<LoadCase> cases;
     RaySpec               rays;
 };
 
 enum class RayMode { Parallel = 1, Cone = 2 };
 
+// p-norm of the thickness measure over one outflow boundary:
+//   P       = ( ∫_Gamma_out rho_a^p / |Gamma_out| )^(1/p)
+//   dP/drho_a = P^(1-p) (rho_a^(p-1), φ_i) / |Gamma_out|,  returned on the full DG space
+class OutflowPNorm : public QuantityOfInterest
+{
+private:
+    ParSubMesh            *submesh;
+    ParFiniteElementSpace *sub_fes;
+    ParFiniteElementSpace *full_fes;
+    const ParGridFunction *rho_a_full;
+    int                    p;
+
+    ParGridFunction         rho_a_sub;
+    GridFunctionCoefficient rho_a_cf;
+    PowerCoefficient        rho_a_p_cf, rho_a_pm1_cf;
+
+    real_t area;
+    real_t pnorm;
+
+public:
+    OutflowPNorm(ParSubMesh &submesh_, ParFiniteElementSpace &sub_fes_,
+                 ParFiniteElementSpace &full_fes_,
+                 const ParGridFunction &rho_a_, int p_);
+
+    real_t Eval() override;
+    void GetGrad(Vector &grad_tv) override;
+};
+
 std::vector<Vector> BuildRays(RayMode mode, const RaySpec &spec, int dim);
 std::unique_ptr<VectorCoefficient> MakeRayCoeff(RayMode mode, const RaySpec &spec,
                                                 const Vector &axis, int dim);
 MeshProblem loadMesh(int myid, const char *mesh_file, Mesh &mesh);
-void SaveSolidSubmesh(ParMesh &pmesh, ParGridFunction &phys_density,
-                      const std::string &run_tag, int order,
-                      real_t threshold = 0.1);
 
 int main(int argc, char *argv[])
 {
@@ -77,25 +104,23 @@ int main(int argc, char *argv[])
     double init_time = MPI_Wtime();
 
     // 1. Options.
-    const char *mesh_file = "";
-    int    ref_levels   = 4;
+    const char *mesh_file = nullptr;
+    int    ref_levels   = 0;
     int    order        = 2;
     real_t r_f          = 0.03;       // min filter length
-    real_t alpha_min    = 1e-6;       // thickness variable lower bound
-    real_t alpha_max    = 1.0;        // thickness variable upper bound
     real_t beta         = 2.0;        // Heaviside beta
     real_t eta          = 0.2;        // Heaviside eta
     real_t vol_fraction = 0.4;
     int    max_it       = 300;
     real_t tol          = 1e-4;       // stopping tol on iteration error
     real_t move         = 0.1;        // MMA move limit
-    real_t epsilon      = 1e-2;       // thickness residual tolerance
-    bool   cp           = false;
+    int    p            = 8;          // p-norm exponent for the max constraint
+    real_t maxthick     = 0.6;        // upper bound on the thickness measure
     bool   pa           = false;
+    bool   cp           = false;
     bool   restart      = false;
     const int seed      = 0;
     int    ray_type = 1;              // thickness ray strategy: 1=parallel, 2=cone
-    int    n_dir_override = -1;       // >= 0 overrides the mesh's ray count
 
     bool visualization = true;
     bool paraview      = false;
@@ -103,36 +128,26 @@ int main(int argc, char *argv[])
     const real_t E_min    = 1e-6;     // SIMP void stiffness
     const real_t E_max    = 1.0;      // SIMP E max
     const real_t exponent = 1.0;      // SIMP exponent (applied to the projection)
-    // --- PLAIN SIMP ---  use p = 3 when SIMP acts directly on rho~
-    // const real_t exponent = 3.0;
 
     int    init_it   = 20;
-    real_t decay     = 0.5;
-    real_t eps_floor = 1e-6;
-    int    decay_int = 50;
 
     int    beta_steps = 50;           // Heaviside beta continuation steps
     real_t beta_max   = 2.0;          // Heaviside beta max value
 
     OptionsParser args(argc, argv);
-    args.AddOption(&mesh_file, "-m", "--mesh", "mesh file to use");
+    args.AddOption(&mesh_file, "-m", "--mesh", "mesh file to use", true);
     args.AddOption(&ray_type, "-rt", "--ray-type", "ray type: 1 = parallel, 2 = cone");
-    args.AddOption(&n_dir_override, "-nd", "--n-dir",
-                    "number of ray directions (-1 = mesh default, 0 = no constraint)");
     args.AddOption(&ref_levels, "-r", "--refine", "uniform refinement levels");
     args.AddOption(&order, "-o", "--order", "finite element order");
     args.AddOption(&vol_fraction, "-vf", "--volume-fraction", "volume fraction");
     args.AddOption(&r_f, "-rf", "--r_fwidth", "min filter width");
-    args.AddOption(&alpha_min, "-amin", "--alpha_min", "lower bound for the thickness variables");
-    args.AddOption(&alpha_max, "-amax", "--alpha_max", "upper bound for the thickness variables");
     args.AddOption(&beta, "-b", "--beta", "Heaviside beta");
     args.AddOption(&beta_steps, "-bs", "--beta-steps", "Heaviside beta continuation steps");
     args.AddOption(&beta_max, "-bm", "--beta-max", "Heaviside beta max value");
     args.AddOption(&eta, "-eta", "--eta", "Heaviside eta");
-    args.AddOption(&epsilon, "-e", "--epsilon", "thickness residual tolerance (initial)");
-    args.AddOption(&decay, "-d", "--decay", "decay rate of epsilon");
-    args.AddOption(&decay_int, "-di", "--decay_int", "decay interval of epsilon");
-    args.AddOption(&init_it, "-ii", "--init_it", "initial iterations before decay");
+    args.AddOption(&p, "-p", "--pnorm", "p-norm exponent for the max constraint");
+    args.AddOption(&maxthick, "-mt", "--max-thickness", "upper bound on the thickness measure");
+    args.AddOption(&init_it, "-ii", "--init_it", "minimum optimization iterations");
     args.AddOption(&max_it, "-mi", "--max-it", "max optimization iterations");
     args.AddOption(&tol, "-tol", "--tol", "stopping tol on max design change");
     args.AddOption(&move, "-mv", "--move", "MMA move limit");
@@ -141,7 +156,7 @@ int main(int argc, char *argv[])
     args.AddOption(&visualization, "-vis", "--visualization",
                     "-no-vis", "--no-visualization", "enable GLVis visualization");
     args.AddOption(&pa, "-pa", "--partial-assembly", "-no-pa", "--no-partial-assembly",
-                    "enable partial assembly");
+                    "enable partial assembly (recommended for large problems)");
     args.AddOption(&cp, "-cp", "--checkpoint", "-no-cp", "--no-checkpoint",
                     "use checkpointing for the optimization");
     args.AddOption(&restart, "-restart", "--restart", "-no-restart", "--no-restart",
@@ -152,24 +167,24 @@ int main(int argc, char *argv[])
         if (myid == 0) { args.PrintUsage(cout); }
         return 1;
     }
+    if (!mesh_file)
+    {
+        if (myid == 0) { cout << "Error: -m <mesh file> is required." << endl; }
+        return 1;
+    }
     if (myid == 0) { args.PrintOptions(cout); }
-
+    
     // initial (uniform) design density -- depends on the parsed options
-    const real_t domain_init = alpha_max * vol_fraction;
+    const real_t domain_init = vol_fraction;
     const RayMode ray_mode = (ray_type == 2) ? RayMode::Cone : RayMode::Parallel;
-
-    // 2. Load the mesh and the problem description (loads, ray spec).
+    
+    // 2. Load the mesh and the problem description (domain, loads, ray spec).
     Mesh mesh;
     MeshProblem prob = loadMesh(myid, mesh_file, mesh);
 
     const int n_elast_solve = static_cast<int>(prob.cases.size());
+    Array<int> &domain_attr     = prob.domain_attr;
     Array<int> &outer_bdr_attrs = prob.outer_bdr_attrs;
-
-    if (n_dir_override >= 0)
-    {
-        prob.rays.parallel.n_dir = n_dir_override;
-        prob.rays.cone.n_dir     = n_dir_override;
-    }
 
     // 3. Refine the mesh and construct pmesh / the design subdomain.
     const int dim = mesh.Dimension();
@@ -177,9 +192,7 @@ int main(int argc, char *argv[])
     vector<Vector> ray_dirs = BuildRays(ray_mode, prob.rays, dim);
     const int n_dir = static_cast<int>(ray_dirs.size());
 
-    // the coarse beam is too small to partition, so refine in serial first
-    const int serial_ref = min(ref_levels, 4);
-    for (int l = 0; l < serial_ref; l++)
+    for (int l = 0; l < ref_levels; l++)
     {
         mesh.UniformRefinement();
     }
@@ -187,20 +200,18 @@ int main(int argc, char *argv[])
     ParMesh pmesh(MPI_COMM_WORLD, mesh);
     mesh.Clear();
 
-    for (int l = serial_ref; l < ref_levels; l++)
-    {
-        pmesh.UniformRefinement();
-    }
-
-    ParMesh &design_domain = pmesh;   // the whole mesh is designable
+    ParSubMesh design_domain = ParSubMesh::CreateFromDomain(pmesh, domain_attr);
 
     // 3b. Build ray fields and mark the outflow boundary for each direction.
-    Array<int> candidate_be;        // no holes, so every boundary element counts
+    Array<int> candidate_be;
     Array<int> candidate_attr;
     for (int i = 0; i < pmesh.GetNBE(); i++)
     {
+        const int el_attr = pmesh.GetBdrAttribute(i);
+
+        if (outer_bdr_attrs.Find(el_attr) < 0) continue;
         candidate_be.Append(i);
-        candidate_attr.Append(pmesh.GetBdrAttribute(i));
+        candidate_attr.Append(el_attr);
     }
 
     vector<unique_ptr<VectorCoefficient>> ray_cf(n_dir);
@@ -210,7 +221,6 @@ int main(int argc, char *argv[])
     {
         ray_cf[r] = MakeRayCoeff(ray_mode, prob.rays, ray_dirs[r], dim);
 
-        // mark outflow (v . n > 0) on the candidate boundary elements
         const int outflow_attr = 100 + r;
         for (int k = 0; k < candidate_be.Size(); k++)
         {
@@ -234,7 +244,6 @@ int main(int argc, char *argv[])
         Array<int> submesh_attr;  submesh_attr.Append(outflow_attr);
         outflow[r] = make_unique<ParSubMesh>(ParSubMesh::CreateFromBoundary(pmesh, submesh_attr));
 
-        // restore original attributes before marking the next ray
         for (int k = 0; k < candidate_be.Size(); k++)
         {
             const int original_attr = candidate_attr[k];
@@ -274,27 +283,20 @@ int main(int argc, char *argv[])
 
     GridFunctionCoefficient rho_cf(&rho);
 
-    // 5b. Thickness design variables live on the outflow submeshes, one set per
-    //     ray direction.  Solving for rho_a requires DG, so alpha also lives in DG.
+    // 5b. Solving for rho_a requires DG.
     DG_FECollection dgfec(order, dim, BasisType::GaussLobatto);
     ParFiniteElementSpace dgfes(&pmesh, &dgfec);
 
     vector<unique_ptr<DG_FECollection>> sub_dg_fec(n_dir);
     vector<unique_ptr<ParFiniteElementSpace>> sub_dg_fes(n_dir);
-    vector<unique_ptr<ParGridFunction>> alpha(n_dir);
-
     for (int r = 0; r < n_dir; r++)
     {
         const int sub_dim = outflow[r]->Dimension();
         sub_dg_fec[r] = make_unique<DG_FECollection>(order, sub_dim, BasisType::GaussLobatto);
         sub_dg_fes[r] = make_unique<ParFiniteElementSpace>(outflow[r].get(), sub_dg_fec[r].get());
-
-        alpha[r] = make_unique<ParGridFunction>(sub_dg_fes[r].get());
-        *alpha[r] = domain_init;
     }
 
     // Lame constants and SIMP material coefficients
-    ConstantCoefficient one_cf(1.0);
     ConstantCoefficient E_cf(3.0), nu_cf(0.3);
     IsoElasticyLambdaCoeff lambda_cf(&E_cf, &nu_cf);
     IsoElasticySchearCoeff mu_cf(&E_cf, &nu_cf);
@@ -313,16 +315,11 @@ int main(int argc, char *argv[])
     SIMPCoefficient simp_cf(rho_erod_cf, E_min, E_max, exponent);                // r(rho_e)
     SIMPGradCoefficient simp_grad_cf(rho_erod_cf, E_min, E_max, exponent);       // r'(rho_e)
 
-    // --- PLAIN SIMP ---  SIMP directly on rho~, no projection
-    // SIMPCoefficient simp_cf(&rho_filter, E_min, E_max, exponent);             // r(rho~)
-    // SIMPGradCoefficient simp_grad_cf(&rho_filter, E_min, E_max, exponent);    // r'(rho~)
-
     // 6. Construct the solvers.
     // 6a. Linear elasticity solvers, one per load case.
     ProductCoefficient E_simp(simp_cf, E_cf);           // r(rho_e) * E0
 
     vector<unique_ptr<IsoLinElasticSolver>> elast(n_elast_solve);
-    vector<unique_ptr<VectorFunctionCoefficient>> vol_force(n_elast_solve);
     for (int i = 0; i < n_elast_solve; i++)
     {
         elast[i] = make_unique<IsoLinElasticSolver>(&design_domain, order);
@@ -337,11 +334,6 @@ int main(int argc, char *argv[])
             {
                 elast[i]->AddSurfLoad(lc.load_attrs[j], lc.fx[j], lc.fy[j], lc.fz[j]);
             }
-        }
-        if (lc.vol_load)
-        {
-            vol_force[i] = make_unique<VectorFunctionCoefficient>(dim, lc.vol_load);
-            elast[i]->SetVolForce(*vol_force[i]);
         }
         for (int j = 0; j < lc.clamp_attrs.Size(); j++)
         {
@@ -359,10 +351,6 @@ int main(int argc, char *argv[])
     ProductCoefficient prod(energy_cf, drdrho_cf);
     ProductCoefficient dcdrho_tilde_cf(-1.0, prod);
 
-    // --- PLAIN SIMP ---  dc/drho~ = -r'(rho~) * psi0
-    // ProductCoefficient prod(energy_cf, simp_grad_cf);
-    // ProductCoefficient dcdrho_tilde_cf(-1.0, prod);
-
     // 6b. Min length scale filter solver (diffusion-mass PDE filter).
     PDEFilter filter(control_fes, filter_fes);
     filter.SetFilterRadius(r_f);
@@ -372,29 +360,31 @@ int main(int argc, char *argv[])
         bool is_outer = (outer_bdr_attrs.Find(a) >= 0);
         if (is_outer)
         {
-            filter_solver.Boundary().Add(a, 0.0);  // free surfaces: rho~ = 0
+            filter_solver.Boundary().Add(a, 0.0);  // Outer boundaries: rho~ = 0
         }
-        // the clamp is left natural, no BC
+        else
+        {
+            filter_solver.Boundary().Add(a, 1.0);  // Holes: rho~ = 1
+        }
     }
     filter.Assemble();
 
-    // Dirichlet lifting for non-homogeneous dirichlet bc
-    // Array<int> filter_bdr_marker(design_domain.bdr_attributes.Max());
-    // filter_bdr_marker = 0;
-    // for (int a = 1; a <= filter_bdr_marker.Size(); a++)
-    // {
-    //     if (outer_bdr_attrs.Find(a) >= 0) { filter_bdr_marker[a-1] = 1; }
-    // }
-    // Array<int> filter_ess_tdofs;
-    // filter_fes.GetEssentialTrueDofs(filter_bdr_marker, filter_ess_tdofs);
-    
-    // Vector rho_filter_lift_tv;
-    // {
-    //     ParGridFunction lift(&filter_fes);
-    //     filter_solver.Solve(lift);
-    //     lift.GetTrueDofs(rho_filter_lift_tv);
-    //     rho_filter_lift_tv.SetSubVector(filter_ess_tdofs, real_t(0));
-    // }
+    // PDEFilter::Mult solves the constrained system without eliminating the
+    // essential columns, so nonzero Dirichlet data never reaches the interior
+    // (rho~ decays to 0 next to the holes). The filter is linear, so recover the
+    // missing A_fe*g lifting once via the FormLinearSystem path and add it back.
+    Array<int> filter_bdr_marker(design_domain.bdr_attributes.Max());
+    filter_bdr_marker = 1;
+    Array<int> filter_ess_tdofs;
+    filter_fes.GetEssentialTrueDofs(filter_bdr_marker, filter_ess_tdofs);
+
+    Vector rho_filter_lift_tv;
+    {
+        ParGridFunction lift(&filter_fes);
+        filter_solver.Solve(lift);
+        lift.GetTrueDofs(rho_filter_lift_tv);
+        rho_filter_lift_tv.SetSubVector(filter_ess_tdofs, real_t(0));
+    }
 
     // 6c. Advection solvers for the thickness measure, one per ray direction,
     //     with the pseudo-transient time step set from the CFL condition.
@@ -426,61 +416,31 @@ int main(int argc, char *argv[])
     VolumeResidual vol_qoi(MPI_COMM_WORLD, &filter_fes, &rho_dila_cf,
                            &rho_dila_grad_cf, vol_fraction);
 
-    // Max-thickness constraint residual per ray:  1/2 ∫_Gamma_out,r (rho_a − α_r)²
-    vector<unique_ptr<AdvectThicknessResidual>> adv_res(n_dir);
+    // p-norm max-thickness measure per ray
+    vector<unique_ptr<OutflowPNorm>> thick_qoi(n_dir);
     for (int r = 0; r < n_dir; r++)
     {
-        adv_res[r] = make_unique<AdvectThicknessResidual>(*outflow[r],
-                                                          advect[r]->GetRhoA(),
-                                                          *alpha[r]);
+        thick_qoi[r] = make_unique<OutflowPNorm>(*outflow[r], *sub_dg_fes[r], dgfes,
+                                                 advect[r]->GetRhoA(), p);
     }
 
-    // --- PLAIN SIMP ---  linear volume constraint on the filtered density,
-    //                     g(rho) = (1, rho~)/Vstar - 1.  The Dirichlet filter BCs
-    //                     make the filter non-volume-preserving, so (1,rho) is
-    //                     not equivalent.
-    // ParLinearForm vol_form(&filter_fes);
-    // vol_form.AddDomainIntegrator(new DomainLFIntegrator(one_cf));
-    // vol_form.Assemble();
-    // std::unique_ptr<HypreParVector> vol_w(vol_form.ParallelAssemble());
-    //
-    // real_t domain_volume;
-    // real_t loc = vol_w->Sum();
-    // MPI_Allreduce(&loc, &domain_volume, 1, MPITypeMap<real_t>::mpi_type, MPI_SUM, MPI_COMM_WORLD);
-    // const real_t Vstar = vol_fraction * domain_volume;
-    //
-    // // d(1,rho~)/drho = L^T w is constant: the filter operator never changes,
-    // // and the Dirichlet lifting contributes a constant offset with zero derivative.
-    // Vector dvol_drho(control_fes.GetTrueVSize());
-    // filter.MultTranspose(*vol_w, dvol_drho);
-
     // 8. MMA optimizer and its per-iteration work vectors.
-    // stacked design  x = [ rho ; alpha_0 ; alpha_1 ; ... ; alpha_{n_dir-1} ]
     const int n  = control_fes.GetTrueVSize();      // local rho design variables
     const int nf = filter_fes.GetTrueVSize();
-    vector<int> m(n_dir);
-    for (int r = 0; r < n_dir; r++) { m[r] = sub_dg_fes[r]->GetTrueVSize(); }
-
-    Array<int> toffsets(n_dir + 2);
-    toffsets[0] = 0;
-    toffsets[1] = n;
-    for (int r = 0; r < n_dir; r++) { toffsets[2 + r] = m[r]; }
-    toffsets.PartialSum();
 
     const int num_con = 1 + n_dir;                  // constraints: volume + one thickness per ray
 
-    // 8a. stacked design  x = [ rho ; alpha_0 ; ... ]
+    // 8a. design  x = rho
     Vector rho_tv(n), rho_old(n);
-    vector<Vector> alpha_tv(n_dir);
+    std::vector<Vector> empty_blocks;
 
     // initialize for normalization
     real_t init_comp = 1.0;
 
     rho.GetTrueDofs(rho_tv);
-    for (int r = 0; r < n_dir; r++) { alpha[r]->GetTrueDofs(alpha_tv[r]); }
 
     // Initialize checkpoint system
-    Checkpoint checkpoint("checkpoints", MPI_COMM_WORLD);
+    Checkpoint checkpoint("checkpoints_ctpnorm", MPI_COMM_WORLD);
     int start_iteration = 1;
     const int cp_interval = 5;
 
@@ -496,30 +456,26 @@ int main(int argc, char *argv[])
     // Loading: restore design variables and metadata from checkpoint
     if (restart)
     {
-        MFEM_VERIFY(checkpoint.Load(rho_tv, alpha_tv),
+        MFEM_VERIFY(checkpoint.Load(rho_tv, empty_blocks),
                     "Failed to load checkpoint data.");
 
         start_iteration = checkpoint.GetIteration() + 1;   // `it` is 1-indexed
-        epsilon = checkpoint.GetEpsilon();
         init_comp = checkpoint.GetInitComp();
 
         if (myid == 0)
         {
-            mfem::out << "\nRestarting from iteration " << start_iteration
-                      << " with epsilon = " << epsilon << "\n";
+            mfem::out << "\nRestarting from iteration " << start_iteration << "\n";
         }
     }
 
     rho.SetFromTrueDofs(rho_tv);
-    for (int r = 0; r < n_dir; r++) { alpha[r]->SetFromTrueDofs(alpha_tv[r]); }
 
-    BlockVector tx_local(toffsets);
-    tx_local.GetBlock(0) = rho_tv;
-    for (int r = 0; r < n_dir; r++) { tx_local.GetBlock(1 + r) = alpha_tv[r]; }
+    Vector tx_local(n);
+    tx_local = rho_tv;
 
     Vector a(num_con), c(num_con), d(num_con);
     a = 0.0; c = 1000.0; d = 0.0;
-    mfem_mma::MMAOptimizerParallel mma(MPI_COMM_WORLD, toffsets.Last(), num_con, tx_local, a, c, d);
+    mfem_mma::MMAOptimizerParallel mma(MPI_COMM_WORLD, n, num_con, tx_local, a, c, d);
 
     // Restore MMA state if restarting (enables proper move-limit adaptation)
     if (start_iteration > 1 && checkpoint.GetXOld1().Size() > 0)
@@ -533,42 +489,47 @@ int main(int argc, char *argv[])
     }
 
     // 8b. objective initialization
-    BlockVector df0dx(toffsets);                    // objective gradient  df0/dx = [ dc/drho ; 0 ; ... ]
+    Vector df0dx(n);                                // objective gradient  df0/dx = dc/drho
     Vector dcdrho(n);                               // compliance gradient  dc/drho
 
     // 8c. local constraints
     Vector fival(num_con);
+    fival = 0.0;
     vector<Vector> dfidx(num_con);
 
-    BlockVector dvol(toffsets);                     // volume gradient  [ dg/drho ; 0 ; ... ]
+    Vector dvol(n);                                 // volume gradient  dg/drho
     dvol = 0.0; dfidx[0] = dvol;
     Vector dvol_tilde(nf);                          // dV_d/drho~
 
-    // one full-size gradient BlockVector per ray-thickness constraint; only
-    // block(0) (drho) and block(1+r) (dalpha_r) are ever nonzero.
-    vector<BlockVector> dthick(n_dir, BlockVector(toffsets));
-
-    // --- PLAIN SIMP ---  the linear volume gradient is constant:  [ L^T w/Vstar ; 0 ; ... ]
-    // dvol.GetBlock(0) = dvol_drho;
-    // dvol.GetBlock(0) /= Vstar;
-    // dfidx[0] = dvol;
+    vector<Vector> dthick(n_dir, Vector(n));
+    for (int r = 0; r < n_dir; r++) { dthick[r] = 0.0; dfidx[1 + r] = dthick[r]; }
 
     // 8d. mma upper and lower bounds
-    BlockVector tx_min(toffsets), tx_max(toffsets);
+    Vector tx_min(n), tx_max(n);
 
     // 9. Visualizations
     // 9a. GLVis
     char vishost[] = "localhost";  int visport = 19916;
-    socketstream sout;
+    socketstream sout_proj, sout_filter;
 
     if (visualization) {
-        sout.open(vishost, visport);
-        sout.precision(8);
+        sout_proj.open(vishost, visport);
+        sout_proj.precision(8);
 
-        sout << "parallel " << num_procs << " " << myid << "\n"
+        sout_proj << "parallel " << num_procs << " " << myid << "\n"
             << "solution\n" << design_domain << rho_filter
-            << "window_title 'Projected density'\n"
+            << "window_title 'Design density r(rho~)'\n"
             << "window_geometry 0 0 800 600\n"
+            << "colorbar_numberformat '%.2f'\n"
+            << "keys Rjlc*****\n" << flush;
+
+        sout_filter.open(vishost, visport);
+        sout_filter.precision(8);
+
+        sout_filter << "parallel " << num_procs << " " << myid << "\n"
+            << "solution\n" << design_domain << rho_filter
+            << "window_title 'Filtered density rho~'\n"
+            << "window_geometry 810 0 800 600\n"
             << "colorbar_numberformat '%.2f'\n"
             << "keys Rjlc*****\n" << flush;
     }
@@ -576,7 +537,7 @@ int main(int argc, char *argv[])
     // 9b. Paraview
     ParGridFunction phys_density(&filter_fes);
     std::ostringstream run_tag;
-    run_tag << "3dbeam_amax" << alpha_max << "_vf" << vol_fraction;
+    run_tag << "ctpnorm_vf" << vol_fraction;
     ParaViewDataCollection paraview_dc(run_tag.str(), &design_domain);
 
     if (paraview) {
@@ -601,26 +562,21 @@ int main(int argc, char *argv[])
     if (myid == 0)
     {
         csv.open("convergence.csv");
-        csv << "it,compliance,volume,res_thick,eps,iterErr,iter_time\n";
+        csv << "it,compliance,volume,pnorm,iterErr,iter_time\n";
     }
 
     // 10. Optimization loop.
     real_t iterationError = 1.0;
 
-    // Track next iteration for epsilon decay and beta doubling
-    int next_epsilon_decay = init_it;
+    // Track next iteration for beta doubling
     int next_beta_double = init_it + beta_steps;
 
-    // These schedule counters (and the accumulated beta value) aren't part of
-    // the checkpoint, so fast-forward them to where a continuous run would be
-    // by iteration start_iteration -- otherwise a restarted run would freeze
-    // epsilon/beta continuation at their initial schedule forever.
+    // This schedule counter (and the accumulated beta value) isn't part of the
+    // checkpoint, so fast-forward it to where a continuous run would be by
+    // iteration start_iteration -- otherwise a restarted run would freeze beta
+    // continuation at its initial schedule forever.
     if (restart)
     {
-        if (decay_int > 0)
-        {
-            while (next_epsilon_decay < start_iteration) { next_epsilon_decay += decay_int; }
-        }
         if (beta_steps > 0)
         {
             while (next_beta_double < start_iteration && beta < beta_max)
@@ -641,13 +597,11 @@ int main(int argc, char *argv[])
     {
         double iter_start_time = MPI_Wtime() - opt_start_time;
 
-        // (1) forward filter:  (r_f^2 K + M) ρ~ = M_fc ρ
+        // (1) forward filter:  (r_f^2 K + M) ρ~ = M_fc ρ  (+ Dirichlet lifting)
         rho.GetTrueDofs(rho_tv);
         Vector rho_filter_tv(nf);
         filter.Mult(rho_tv, rho_filter_tv);
-        
-        // --- DIRICHLET LIFTING ---
-        // rho_filter_tv += rho_filter_lift_tv;
+        rho_filter_tv += rho_filter_lift_tv;
         rho_filter.SetFromTrueDofs(rho_filter_tv);
 
         // (2) state solves:  K(ρ~) u = f   (self-adjoint compliance), averaged
@@ -655,7 +609,6 @@ int main(int argc, char *argv[])
         real_t compliance = 0.0;
         Vector adj_rhs_tv(nf);
         adj_rhs_tv = 0.0;
-        double elast_runtime = MPI_Wtime();
         for (int i = 0; i < n_elast_solve; i++)
         {
             elast[i]->Assemble();
@@ -669,7 +622,6 @@ int main(int argc, char *argv[])
             std::unique_ptr<HypreParVector> adj_rhs_e_tv(adj_rhs.ParallelAssemble());
             adj_rhs_tv += *adj_rhs_e_tv;
         }
-        elast_runtime = MPI_Wtime() - elast_runtime;
         compliance  /= n_elast_solve;
         adj_rhs_tv  /= n_elast_solve;
 
@@ -677,8 +629,7 @@ int main(int argc, char *argv[])
         //     w~  = (r_f^2 K + M)^{-1} ∫ (-r'(ρ~) psi_0) φ_i
         //     dc/drho = M_fc^T w~
         filter.MultTranspose(adj_rhs_tv, dcdrho);
-        df0dx.GetBlock(0) = dcdrho;                     // objective gradient
-        for (int r = 0; r < n_dir; r++) { df0dx.GetBlock(1 + r) = 0.0; }
+        df0dx = dcdrho;                                 // objective gradient
 
         // (4) volume constraint and gradient on the dilated field:
         //       g        = V_d / V* - 1
@@ -686,83 +637,70 @@ int main(int argc, char *argv[])
         fival(0) = vol_qoi.Eval() - 1.0;                // update constraint value
         real_t vol = (fival(0) + 1.0) * vol_fraction;   // current volume fraction
         vol_qoi.GetGrad(dvol_tilde);
-        filter.MultTranspose(dvol_tilde, dvol.GetBlock(0));
+        filter.MultTranspose(dvol_tilde, dvol);
         dfidx[0] = dvol;                                // update constraint gradient
 
-        // --- PLAIN SIMP ---  linear volume constraint on rho~ (gradient is
-        //                     constant, set once outside the loop)
-        // const real_t vol_int = InnerProduct(MPI_COMM_WORLD, *vol_w, rho_filter_tv);
-        // real_t vol = vol_int / domain_volume;
-        // fival(0) = vol_int / Vstar - 1.0;
-
-        // (5) advect rho~ along each ray to get the thickness measure rho_a, then the
-        //     max-thickness constraint and gradient per direction:
-        //       1/2 ∫(rho_a−α_r)² − ε ≤ 0
-        //       dR/dalpha_r = (α_r − rho_a) on Gamma_out,r
-        //       dR/drho     = M_fc^T N^T (rho_a − α_r)  via the adjoint advection solve
-        real_t res_thick = -infinity();
+        // (5) advect rho~ along each ray to get the thickness measure rho_a, then
+        //     the p-norm max-thickness constraint and gradient per direction:
+        //       g_r       = P_r / maxthick - 1
+        //       dg_r/drho = M_fc^T N^T (dP_r/drho_a) / maxthick
+        real_t pnorm_max = -infinity();
         real_t fi_thick  = -infinity();
-        double adv_runtime = MPI_Wtime();
         for (int r = 0; r < n_dir; r++)
         {
             advect[r]->SetRhs(rho_filter_tv);
             advect[r]->FSolve();
-            const real_t thickres = adv_res[r]->Eval();
-            res_thick = std::max(res_thick, thickres);
 
-            dthick[r] = 0.0;
+            const real_t pnorm_val = thick_qoi[r]->Eval();
+            fival(1 + r) = pnorm_val / maxthick - 1.0;
 
-            Vector dGdrhoa;
-            adv_res[r]->GetGrad(dGdrhoa, dthick[r].GetBlock(1 + r));
+            Vector dPdrhoa;
+            thick_qoi[r]->GetGrad(dPdrhoa);
+            dPdrhoa /= maxthick;
 
-            // transfer dGdrhoa back to the full-domain dgfes
-            ParGridFunction g_sub(sub_dg_fes[r].get());  g_sub.SetFromTrueDofs(dGdrhoa);
-            ParGridFunction g_full(&dgfes);              g_full = 0.0;
-            outflow[r]->Transfer(g_sub, g_full);
-            Vector rhs_full;  g_full.GetTrueDofs(rhs_full);
-
-            // chain rule adjoint solve: dG/drho = M_fc^T N^T g
-            advect[r]->SetAdjointRhs(rhs_full);
+            advect[r]->SetAdjointRhs(dPdrhoa);
             advect[r]->ASolve();
-            filter.MultTranspose(advect[r]->GetSensitivity(), dthick[r].GetBlock(0));
+            filter.MultTranspose(advect[r]->GetSensitivity(), dthick[r]);
+            dfidx[1 + r] = dthick[r];
 
-            fival(1 + r) = thickres / epsilon - 1.0;     // update constraint value
-            dthick[r] /= epsilon;
-            dfidx[1 + r] = dthick[r];                    // update constraint gradient
-
-            fi_thick = std::max(fi_thick, fival(1 + r));
+            pnorm_max = std::max(pnorm_max, pnorm_val);
+            fi_thick  = std::max(fi_thick, fival(1 + r));
         }
-        adv_runtime = MPI_Wtime() - adv_runtime;
 
-        // (6) box constraints:  rho ∈ [0,1],  α_r ∈ [alpha_min, alpha_max]  (move limits)
-        for (int r = 0; r < n_dir; r++) { alpha[r]->GetTrueDofs(alpha_tv[r]); }
+        // printing max thickness per direction
+        for (int r = 0; r < n_dir; r++)
+        {
+            real_t local_max = advect[r]->GetRhoA().Max();
+            real_t global_max = local_max;
+            MPI_Allreduce(&local_max, &global_max, 1, MPITypeMap<real_t>::mpi_type, MPI_MAX,
+                        advect[r]->GetRhoA().ParFESpace()->GetComm());
+
+            if (myid == 0)
+            {
+                mfem::out << "ray direction [" << r << "]"
+                        << ":    max rho_a = " << fixed << setprecision(8) << global_max
+                        << ",    residual = " << scientific << setprecision(8) << fival[r+1] << endl;
+            }
+        }
+
+        // (6) box constraints:  rho ∈ [0,1]  (move limits)
         for (int i = 0; i < n; i++)
         {
             tx_min[i] = std::max(real_t(0), rho_tv[i] - move);
             tx_max[i] = std::min(real_t(1), rho_tv[i] + move);
         }
-        for (int r = 0; r < n_dir; r++)
-        {
-            for (int i = 0; i < m[r]; i++)
-            {
-                tx_min[toffsets[1 + r] + i] = std::max(alpha_min, alpha_tv[r][i] - move);
-                tx_max[toffsets[1 + r] + i] = std::min(alpha_max, alpha_tv[r][i] + move);
-            }
-        }
 
-        // (7) MMA update on the stacked design  x = [ ρ ; α_0 ; ... ; α_{n_dir-1} ]
-        tx_local.GetBlock(0) = rho_tv;
-        for (int r = 0; r < n_dir; r++) { tx_local.GetBlock(1 + r) = alpha_tv[r]; }
+        // (7) MMA update on the design  x = ρ
+        tx_local = rho_tv;
         rho_old = rho_tv;
 
         // Normalize compliance and gradient by initial value
         if (it == 1) { init_comp = compliance; }
         compliance /= init_comp;
         df0dx /= init_comp;
-
+        
         mma.Update(tx_local, df0dx, compliance, fival, dfidx.data(), tx_min, tx_max);
-        rho.SetFromTrueDofs(tx_local.GetBlock(0));
-        for (int r = 0; r < n_dir; r++) { alpha[r]->SetFromTrueDofs(tx_local.GetBlock(1 + r)); }
+        rho.SetFromTrueDofs(tx_local);
 
         // measure iteration error
         ParGridFunction rho_old_gf(&control_fes);
@@ -771,55 +709,39 @@ int main(int argc, char *argv[])
 
         double iter_end_time = MPI_Wtime() - opt_start_time;
         double iter_runtime  = iter_end_time - iter_start_time;
-        double elapsed_time  = MPI_Wtime() - init_time;   // includes the setup block
 
         // (8) reporting
         if (myid == 0)
         {
             const int w = 14;               // column width
-            mfem::out << "\nIteration " << it << '\n' << left
+            mfem::out << "\niteration " << it << '\n' << left
                     << setw(w) << "c"
                     << setw(w) << "volume"
-                    << setw(w) << "res_thick_max"
-                    << setw(w) << "eps"
+                    << setw(w) << "pnorm_max"
                     << setw(w) << "fival_max"
                     << setw(w) << "beta"
                     << setw(w) << "iterErr" << '\n'
-                    << string(7*w, '=') << '\n'
+                    << string(6*w, '=') << '\n'
                     << fixed      << setprecision(6) << setw(w) << compliance
                     <<               setprecision(4) << setw(w) << vol
-                    << scientific << setprecision(3) << setw(w) << res_thick
-                    <<               setprecision(3) << setw(w) << epsilon
+                    << scientific << setprecision(3) << setw(w) << pnorm_max
                     <<               setprecision(3) << setw(w) << fi_thick
                     << fixed      << setprecision(0) << setw(w) << beta
-                    << scientific << setprecision(4) << setw(w) << iterationError << endl;
-               
-            // runtime outputs
-            mfem::out << '\n' << fixed << setprecision(2)
-                    << "elast solve: "     << elast_runtime << " s\n"
-                    << "advection solve: " << adv_runtime   << " s\n"
-                    << "iteration: "       << iter_runtime  << " s\n"
-                    << "total elapsed: "   << elapsed_time  << " s\n" << endl;
+                    << scientific << setprecision(4) << setw(w) << iterationError << '\n'
+                    << "iteration runtime: " << fixed << setprecision(2)
+                    << iter_runtime << " s,   elapsed time at end: "
+                    << iter_end_time << " s" << endl;
 
             csv << it << ','
                 << scientific << setprecision(8) << compliance << ','
                 << vol << ','
-                << res_thick << ','
-                << epsilon << ','
+                << pnorm_max << ','
                 << iterationError << ','
                 << iter_runtime << '\n';
             csv.flush();
         }
 
-        // (9) tighten the max-thickness tolerance and update beta
-        // Epsilon decay: starts at init_it, then every decay_int iterations
-        if (it == next_epsilon_decay)
-        {
-            epsilon = std::max(epsilon * decay, eps_floor);
-            next_epsilon_decay += decay_int;
-        }
-
-        // Beta doubling: starts at init_it + beta_steps, then every beta_steps iterations
+        // (9) Beta doubling: starts at init_it + beta_steps, then every beta_steps iterations
         if (it == next_beta_double && beta < beta_max)
         {
             beta *= 2;
@@ -833,24 +755,24 @@ int main(int argc, char *argv[])
         if (cp && it % cp_interval == 0)
         {
             rho.GetTrueDofs(rho_tv);
-            for (int r = 0; r < n_dir; r++) { alpha[r]->GetTrueDofs(alpha_tv[r]); }
 
             // Save with MMA state for proper restart
-            checkpoint.Save(rho_tv, alpha_tv,
+            checkpoint.Save(rho_tv, empty_blocks,
                             mma.GetXOld1(), mma.GetXOld2(),
                             mma.GetLowerAsymptotes(), mma.GetUpperAsymptotes(),
-                            it, n_dir, ref_levels, order, epsilon, init_comp);
+                            it, n_dir, ref_levels, order, real_t(0), init_comp);
         }
 
         // physical density for both GLVis and the ParaView archive
         phys_density.ProjectCoefficient(rho_inter_cf);
-        // --- PLAIN SIMP ---
-        // phys_density.ProjectCoefficient(simp_cf);
 
         if (visualization)
         {
-            sout << "parallel " << num_procs << " " << myid << "\n"
+            sout_proj << "parallel " << num_procs << " " << myid << "\n"
                 << "solution\n" << design_domain << phys_density << flush;
+
+            sout_filter << "parallel " << num_procs << " " << myid << "\n"
+                << "solution\n" << design_domain << rho_filter << flush;
         }
 
         // if (paraview)
@@ -878,17 +800,10 @@ int main(int argc, char *argv[])
         paraview_dc.Save();
     }
 
-    // 11. Post process the solution mesh.
-    if (paraview)
-    {
-        SaveSolidSubmesh(pmesh, phys_density, run_tag.str(), order);
-    }
-
     return 0;
 }
 
-// ray axis directions for the selected mode, evenly spaced over its ray set,
-// sweeping the last two coordinates (the Y-Z cross-section in 3D)
+// ray axis directions for the selected mode, evenly spaced over its ray set
 std::vector<Vector> BuildRays(RayMode mode, const RaySpec &spec, int dim)
 {
     const RaySet &s = (mode == RayMode::Cone) ? spec.cone : spec.parallel;
@@ -898,8 +813,8 @@ std::vector<Vector> BuildRays(RayMode mode, const RaySpec &spec, int dim)
     {
         const real_t ang = s.start + s.span * i / s.n_dir;
         Vector v(dim); v = 0.0;
-        v(dim-2) = cos(ang);
-        v(dim-1) = sin(ang);
+        v(0) = cos(ang);
+        v(1) = sin(ang);
         dirs.push_back(v);
     }
     return dirs;
@@ -927,98 +842,173 @@ std::unique_ptr<VectorCoefficient> MakeRayCoeff(RayMode mode, const RaySpec &spe
     return std::make_unique<VectorFunctionCoefficient>(dim, field);
 }
 
-// save the thresholded design by clipping from the max value
-void SaveSolidSubmesh(ParMesh &pmesh, ParGridFunction &phys_density,
-                      const std::string &run_tag, int order, real_t threshold)
+// disk mesh: one load case, 18 rays swept over the full circle
+static MeshProblem SetupDisk6Holes(Mesh &mesh, const char *mesh_file)
 {
-    const int sol_attr = 1000;
-
-    for (int i = 0; i < pmesh.GetNE(); i++)
-    {
-        real_t elem_max = -infinity();
-
-        ElementTransformation *T = pmesh.GetElementTransformation(i);
-        const FiniteElement *fe = phys_density.FESpace()->GetFE(i);
-        const IntegrationRule &ir = fe->GetNodes();
-
-        for (int j = 0; j < ir.GetNPoints(); j++)
-        {
-            const IntegrationPoint &ip = ir.IntPoint(j);
-            T->SetIntPoint(&ip);
-            real_t val = phys_density.GetValue(*T, ip);
-            elem_max = max(elem_max, val);
-        }
-
-        if (elem_max > threshold)
-        {
-            pmesh.SetAttribute(i, sol_attr);
-        }
-    }
-    pmesh.SetAttributes();
-
-    Array<int> sol_mesh_attrs(1);
-    sol_mesh_attrs[0] = sol_attr;
-
-    ParSubMesh sol_submesh = ParSubMesh::CreateFromDomain(pmesh, sol_mesh_attrs);
-    ParFiniteElementSpace filter_subfes(&sol_submesh, phys_density.ParFESpace()->FEColl());
-    ParGridFunction phys_density_sub(&filter_subfes);
-    ParSubMesh::Transfer(phys_density, phys_density_sub);
-
-    // save in separate paraview
-    ParaViewDataCollection dc(run_tag, &sol_submesh);
-    dc.SetPrefixPath("ParaView_fsol");
-    dc.SetLevelsOfDetail(order);
-    dc.SetDataFormat(VTKFormat::BINARY);
-    dc.SetHighOrderOutput(true);
-    dc.RegisterField("density", &phys_density_sub);
-    dc.Save();
-}
-
-// body force pushing down (-Z) on a small patch near the right end, bottom corner
-static void BeamLoad(const Vector &x, Vector &f)
-{
-    const int dim = x.Size();
-
-    f.SetSize(dim);
-    f = 0.0;
-
-    real_t radius = 0.05;
-    real_t center_x = 2.9;
-    real_t center_z = 0.1;
-
-    bool x_in_range = (x[0] < center_x + radius) && (x[0] > center_x - radius);
-    bool z_in_range = (x[2] < center_z + radius) && (x[2] > center_z - radius);
-
-    if (x_in_range && z_in_range) f(2) = -1.0;
-}
-
-// 3x1x1 cantilever beam: clamped at X=0, one load case with a body force
-static MeshProblem Setup3DBeam(Mesh &mesh)
-{
-    mesh = Mesh::MakeCartesian3D(3, 1, 1, Element::HEXAHEDRON, 3.0, 1.0, 1.0);
+    mesh = Mesh(mesh_file);
 
     MeshProblem p;
-    // attrs: 1 z=0, 2 y=0, 3 x=lx, 4 y=ly, 5 x=0 (clamped), 6 z=lz
-    p.outer_bdr_attrs = Array<int>({1, 2, 3, 4, 6});
-    p.rays.parallel = { 0, M_PI,     0.0 };   // n_dir = 0 turns the thickness
-    p.rays.cone     = { 0, 2 * M_PI, 0.0 };   // constraint off, run -nd 4 for 4 rays
+    p.domain_attr.Append(1);
+    p.outer_bdr_attrs = Array<int>({1});
+    p.rays.parallel = { 18, 2 * M_PI, 0.0 };
+    p.rays.cone     = { 18, 2 * M_PI, 0.0 };
 
     p.cases.resize(1);
     LoadCase &lc = p.cases[0];
-    lc.clamp_attrs = Array<int>({ 5 });
-    lc.vol_load    = BeamLoad;
+    lc.clamp_attrs = Array<int>({ 7 });
 
+    const real_t angles_deg_forces[] = {90.0, 162.0, 234.0, 306.0, 18.0};
+    for (int j = 0; j < 5; j++)
+    {
+        const real_t ang = angles_deg_forces[j] * M_PI / 180.0;
+        const real_t fdx = -sin(ang), fdy = cos(ang);
+        lc.load_attrs.Append(2 + j);
+        lc.fx.Append(-fdx);
+        lc.fy.Append(-fdy);
+        lc.fz.Append(0.0);
+    }
+    return p;
+}
+
+// square mesh: two load cases with swapped clamp/load, 4 parallel or 8 cone rays
+static MeshProblem SetupSquare4Holes(Mesh &mesh, const char *mesh_file)
+{
+    mesh = Mesh(mesh_file);
+
+    MeshProblem p;
+    p.domain_attr.Append(1);
+    p.outer_bdr_attrs = Array<int>({1, 2, 3, 4});
+    p.rays.parallel = { 4, M_PI,     0.0 };
+    p.rays.cone     = { 8, 2 * M_PI, 0.0 };
+
+    p.cases.resize(2);
+
+    // first elast solve
+    p.cases[0].clamp_attrs = Array<int>({ 6, 7});
+    p.cases[0].load_attrs  = Array<int>({ 5, 8});
+    p.cases[0].fx          = Array<real_t>({ 1,-1});
+    p.cases[0].fy          = Array<real_t>({-1, 1});
+    p.cases[0].fz          = Array<real_t>({ 0, 0});
+
+    // second elast solve
+    p.cases[1].clamp_attrs = Array<int>({ 5, 8});
+    p.cases[1].load_attrs  = Array<int>({ 6, 7});
+    p.cases[1].fx          = Array<real_t>({-1, 1});
+    p.cases[1].fy          = Array<real_t>({-1, 1});
+    p.cases[1].fz          = Array<real_t>({ 0, 0});
+
+    return p;
+}
+
+// pentagon mesh: five load cases, rays aligned with the edges
+static MeshProblem SetupPentagon(Mesh &mesh, const char *mesh_file)
+{
+    mesh = Mesh(mesh_file);
+
+    MeshProblem p;
+    p.domain_attr.Append(1);
+    p.outer_bdr_attrs = Array<int>({1});
+    p.rays.parallel = { 5, 2 * M_PI, 0.0 };     // aligned with pentagon edges
+    p.rays.cone     = { 5, 2 * M_PI, 0.0 };
+
+    const int n_case = 5;
+    const real_t angles_deg_forces[] = {90.0, 162.0, 234.0, 306.0, 18.0};
+    real_t fdx[5], fdy[5];
+    for (int k = 0; k < n_case; k++)
+    {
+        const real_t ang = angles_deg_forces[k] * M_PI / 180.0;
+        fdx[k] = cos(ang);
+        fdy[k] = sin(ang);
+    }
+
+    const int first_attr = 2;
+    p.cases.resize(n_case);
+    for (int i = 0; i < n_case; i++)
+    {
+        const int clamped_attr = first_attr + i;
+        LoadCase &lc = p.cases[i];
+        lc.clamp_attrs = Array<int>({ clamped_attr });
+
+        for (int j = 0; j < n_case; j++)
+        {
+            const int attr = first_attr + j;
+            if (attr == clamped_attr) { continue; }
+            lc.load_attrs.Append(attr);
+            lc.fx.Append(-fdx[j]);
+            lc.fy.Append(-fdy[j]);
+            lc.fz.Append(0.0);
+        }
+    }
     return p;
 }
 
 // select the per-mesh setup from the mesh file name
 MeshProblem loadMesh(int myid, const char *mesh_file, Mesh &mesh)
 {
-    if (mesh_file[0] == '\0')
+    if (strstr(mesh_file, "disk_6_holes.msh") != NULL)
     {
-        return Setup3DBeam(mesh);
+        return SetupDisk6Holes(mesh, mesh_file);
+    }
+    else if (strstr(mesh_file, "d_square_4_holes.msh") != NULL)
+    {
+        return SetupSquare4Holes(mesh, mesh_file);
+    }
+    else if (strstr(mesh_file, "circular_5_holes_pentagon.msh") != NULL)
+    {
+        return SetupPentagon(mesh, mesh_file);
     }
 
     if (myid == 0) { mfem::out << "invalid mesh file" << endl; }
     return MeshProblem();
+}
+
+OutflowPNorm::OutflowPNorm(ParSubMesh &submesh_, ParFiniteElementSpace &sub_fes_,
+                           ParFiniteElementSpace &full_fes_,
+                           const ParGridFunction &rho_a_, int p_)
+    : submesh(&submesh_), sub_fes(&sub_fes_), full_fes(&full_fes_),
+      rho_a_full(&rho_a_), p(p_), rho_a_sub(&sub_fes_), rho_a_cf(&rho_a_sub),
+      rho_a_p_cf(rho_a_cf, p_), rho_a_pm1_cf(rho_a_cf, p_ - 1), pnorm(0.0)
+{
+    rho_a_sub = 0.0;
+
+    ConstantCoefficient one(1.0);
+    ParLinearForm lf(sub_fes);
+    lf.AddDomainIntegrator(new DomainLFIntegrator(one));
+    lf.Assemble();
+    std::unique_ptr<HypreParVector> tv(lf.ParallelAssemble());
+
+    real_t loc = tv->Sum();
+    MPI_Allreduce(&loc, &area, 1, MPITypeMap<real_t>::mpi_type, MPI_SUM,
+                  sub_fes->GetComm());
+}
+
+real_t OutflowPNorm::Eval()
+{
+    submesh->Transfer(*rho_a_full, rho_a_sub);
+
+    ParLinearForm lf(sub_fes);
+    lf.AddDomainIntegrator(new DomainLFIntegrator(rho_a_p_cf));
+    lf.Assemble();
+    std::unique_ptr<HypreParVector> tv(lf.ParallelAssemble());
+
+    real_t loc = tv->Sum(), glob;
+    MPI_Allreduce(&loc, &glob, 1, MPITypeMap<real_t>::mpi_type, MPI_SUM,
+                  sub_fes->GetComm());
+
+    pnorm = pow(glob / area, 1.0 / p);
+    return pnorm;
+}
+
+void OutflowPNorm::GetGrad(Vector &grad_tv)
+{
+    ParLinearForm lf(sub_fes);
+    lf.AddDomainIntegrator(new DomainLFIntegrator(rho_a_pm1_cf));
+    lf.Assemble();
+    std::unique_ptr<HypreParVector> tv(lf.ParallelAssemble());
+    *tv *= pow(pnorm, 1.0 - p) / area;
+
+    ParGridFunction g_sub(sub_fes);   g_sub.SetFromTrueDofs(*tv);
+    ParGridFunction g_full(full_fes); g_full = 0.0;
+    submesh->Transfer(g_sub, g_full);
+    g_full.GetTrueDofs(grad_tv);
 }
