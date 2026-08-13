@@ -35,8 +35,7 @@ public:
     void SetButcherTable(mfem::Array2D<real_t> &A_ex_, mfem::Array2D<real_t> &A_imp_, Vector &b_ex_, Vector &b_imp_);
     void Init(IMEXAdvectionDiffusionSolver &f_);
     void AdjointStep(Vector &lam, Vector &x,Vector &dJdrho_tilde, real_t &t, real_t &dt);
-    void I_plus_ExplicitMult(Vector &x, Vector &rhs, real_t a);
-    void I_plus_ImplicitMult(Vector &x, Vector &rhs, real_t a, real_t dt);
+    Vector ComboAdjointMult(real_t a1, real_t a2, real_t dt, Vector &x, real_t t);
     void Step(Vector &x, real_t &t, real_t &dt);
     static MFEM_EXPORT std::unique_ptr<TopOptRKIMEXSolver> SelectTopOptRKIMEX(const int ode_solver_type);
 };
@@ -49,18 +48,22 @@ void TopOptRKIMEXSolver::SetButcherTable(mfem::Array2D<real_t> &A_ex_, mfem::Arr
    b_imp = b_imp_;
 }
 
-void TopOptRKIMEXSolver::I_plus_ExplicitMult(Vector &x, Vector &rhs, real_t a)
+Vector TopOptRKIMEXSolver::ComboAdjointMult(real_t a1, real_t a2, real_t dt, Vector &x, real_t t)
 {
-   f->AdjointMult(x, rhs);
-   rhs *= a;
-   rhs.Add(1.0, x);
-}
+   Vector rhs(f->Width());
+   Vector rhs2(f->Width());
+   f->SetEvalMode(TimeDependentOperator::ADDITIVE_TERM_1);
+   f->AdjointMult(x, rhs2);
+   rhs2 *= a1;
 
-void TopOptRKIMEXSolver::I_plus_ImplicitMult(Vector &x, Vector &rhs, real_t a, real_t dt)
-{
+   f->SetEvalMode(TimeDependentOperator::ADDITIVE_TERM_2);
+   f->SetTime(t + dt);
    f->AdjointImplicitSolve(dt, x, rhs);
-   rhs *= a;
+   f->SetTime(t);
+   rhs *= a2;
+   rhs.Add(1.0, rhs2);
    rhs.Add(1.0, x);
+   return rhs;
 }
 
 
@@ -113,112 +116,86 @@ void TopOptRKIMEXSolver::Step(Vector &x, real_t &t, real_t &dt)
 
 void TopOptRKIMEXSolver::AdjointStep(Vector &lam, Vector &x, Vector &dJdrho_tilde, real_t &t, real_t &dt)
 {
+
+    // adjoint computation 
     f->SetTime(t);
+    Vector x_old = x;
+    Vector y = x_old; 
     f->SetEvalMode(TimeDependentOperator::ADDITIVE_TERM_1);
+    Vector imp_l(lam.Size());
+    Vector exp_l(lam.Size());
+    Vector lam_old = lam;
+    f->AdjointMult(lam_old, exp_l);
 
     // state 
-    Vector x_old = x;
     f->Mult(x, k);
-    x_stages.push_back(x);
     ks_ex.push_back(k);
     x.Add(dt*b_ex(0), ks_ex[0]);
 
-    Vector lam_old = lam;
-    Vector dgdrho_tilde(dJdrho_tilde.Size());
-    Vector dfdrho_tilde(dJdrho_tilde.Size());
-   
-    // Compute Adjoint stage. dgdrho_tilde will pop out.
-    f->AdjointMult(lam, k);
-    lks_ex.push_back(k);
-    lam.Add(dt*b_ex(0), k);
-   // precompute impl_adj_mult
-    Vector impl_adj_mult(lam.Size());
-    Vector expl_adj_mult = k;
-    f->AdjointImplicitSolve(A_imp(stage, stage)*dt, lam_old, impl_adj_mult);
-    f->AdjointMult(impl_adj_mult, k);
-    lks_ex.push_back(k);
+    // design gradient
+    Vector exp_grad_placeholder(dJdrho_tilde.Size());
+    Vector imp_grad_placeholder(dJdrho_tilde.Size());
+    exp_grad_placeholder = 0.0;
+    f->ExplicitMultDesignGradient(1.0, lam_old, x_old, exp_grad_placeholder);
+    dJdrho_tilde.Add(dt*b_ex(0), exp_grad_placeholder);
 
-
-    // store first gradient term
-    dgdrho_tilde = 0.0;
-    f->ExplicitMultDesignGradient(1.0, lam_old, x_old, dgdrho_tilde);
-    dks_ex.push_back(dgdrho_tilde);
-    dJdrho_tilde.Add(dt*b_ex(0), dks_ex[0]);
-    yd.SetSize(dgdrho_tilde.Size());
-    
+    f->SetEvalMode(TimeDependentOperator::ADDITIVE_TERM_2);
+    f->SetTime(t + A_imp(0, 0)*dt);
+    f->AdjointImplicitSolve(dt, lam_old, imp_l);
+    f->SetTime(t);
+    lam.Add(dt*b_ex(0), exp_l);
     for (int stage = 0; stage < num_stages; stage++)
     {
-       f->SetTime(t+A_imp(stage, stage)*dt);
-       lks_imp.push_back(k);
-       yl = lam_old;
-       yd = 0.0;
-       y = x_old;
-       for (int j = 0; j < stage; j++)
-       {
-            yl.Add(dt*A_ex(stage+1, j), lks_ex[j]);
-            yl.Add(dt*A_imp(stage, j), lks_imp[j]); 
-            yd.Add(dt*A_ex(stage+1, j), dks_ex[j]);
-            yd.Add(dt*A_imp(stage, j), dks_imp[j]); 
-            y.Add(dt*A_ex(stage+1, j), ks_ex[j]);
-            y.Add(dt*A_imp(stage, j), ks_imp[j]); 
-       }
-       y.Add(dt*A_ex(stage+1, stage), ks_ex[stage]);
-       //yl.Add(dt*A_ex(stage+1, stage), lks_ex[stage]);
-       yd.Add(dt*A_ex(stage+1, stage), dks_ex[stage]);
-       f->SetEvalMode(TimeDependentOperator::ADDITIVE_TERM_2);
-
-       // state 
-       f->ImplicitSolve(A_imp(stage, stage)*dt, y, k);
-       ks_imp.push_back(k);
-       x.Add(dt*b_imp(stage), ks_imp[stage]);
-
-       // adjoint
-       lam.Add(dt*b_imp(stage), yl);
-       f->AdjointImplicitSolve(A_imp(stage, stage)*dt, expl_adj_mult, k);
-       lks_expl.push_back(k);
-
-       // design gradient computation 
-       dfdrho_tilde = 0.0;
-       f->ImplicitSolveDesignGradient(A_imp(stage, stage)*dt, lam_old, y, dfdrho_tilde);
-       f->ExplicitMultDesignGradient(dt, lks_imp[stage], x_old, dfdrho_tilde);
-       dks_imp.push_back(dfdrho_tilde);
-       dJdrho_tilde.Add(dt*b_imp(stage), dks_imp[stage]);
-       //dJdrho_tilde.Add(dt*b_imp(stage), dfdrho_tilde);
-
-       // explicit part
-       y.Add(dt*A_imp(stage, stage), ks_imp[stage]);
-       yl.Add(dt*A_imp(stage, stage), lks_imp[stage]);
-       yd.Add(dt*A_imp(stage, stage), dks_imp[stage]);
-       f->SetTime(t);
-       f->SetEvalMode(TimeDependentOperator::ADDITIVE_TERM_1); 
-       
-       if (b_ex(stage+1) != 0.0)
-       {
-            // state 
-            f->Mult(y, k);
-            ks_ex.push_back(k);
-            x.Add(dt*b_ex(stage+1), ks_ex[stage+1]); 
-
-            // adjoint
-            lam.Add(dt*b_ex(stage+1), yl);
-            f->AdjointMult(impl_adj_mult, k);
-            lks_ex.push_back(k);
-
-            // design gradient
-            dgdrho_tilde = 0.0;
-            f->ExplicitMultDesignGradient(1.0, yl, y, dgdrho_tilde);
-            dks_ex.push_back(dgdrho_tilde);
-            dJdrho_tilde.Add(dt*b_ex(stage+1), dks_ex[stage+1]);
-       }
+      y = x_old;
+      exp_grad_placeholder = 0.0;
+      imp_grad_placeholder = 0.0;
+      for(int j = stage; j >= 0; j--)
+      {
+         y.Add(dt*A_ex(stage+1, j), ks_ex[j]);
+         if (j != stage){y.Add(dt*A_imp(stage, j), ks_imp[j]);} 
+         real_t aimp = (j == stage) ? 0 : A_imp(j, j-1);
+         if (j > 0)
+         {
+            f->ExplicitMultDesignGradient(dt*A_ex(1,0), exp_l, x_old, exp_grad_placeholder);
+            dJdrho_tilde.Add(dt*b_ex(stage+1), exp_grad_placeholder);
+         }
+         f->ExplicitMultDesignGradient(dt*A_ex(1,0), imp_l, x_old, imp_grad_placeholder);
+         dJdrho_tilde.Add(dt*b_imp(stage), imp_grad_placeholder);
+         exp_l = ComboAdjointMult(dt*A_ex(j+1, j), dt*aimp,  dt*aimp, exp_l, t);
+         imp_l = ComboAdjointMult(dt*A_ex(j+1, j), dt*aimp,  dt*aimp, imp_l, t); 
+      }
+      exp_grad_placeholder = 0.0;
+      imp_grad_placeholder = 0.0;
+      f->ExplicitMultDesignGradient(dt, lam_old, y, exp_grad_placeholder);
+      f->ImplicitSolveDesignGradient(dt, lam_old, y, imp_grad_placeholder);
+      dJdrho_tilde.Add(dt*b_ex(stage+1), exp_grad_placeholder);
+      dJdrho_tilde.Add(dt*b_imp(stage), imp_grad_placeholder);
+      lam.Add(dt*b_ex(stage+1), exp_l);
+      lam.Add(dt*b_imp(stage), imp_l);
+      if (stage != num_stages - 1)
+      {
+         f->SetEvalMode(TimeDependentOperator::ADDITIVE_TERM_1);
+         f->AdjointMult(lam_old, exp_l);
+         f->SetEvalMode(TimeDependentOperator::ADDITIVE_TERM_2);
+         f->SetTime(t + A_imp(stage+1, stage+1)*dt);
+         f->AdjointImplicitSolve(dt, lam_old, imp_l);
+         f->SetTime(t);
+      }
+      f->SetEvalMode(TimeDependentOperator::ADDITIVE_TERM_2);
+      f->SetTime(t+A_imp(stage, stage)*dt);
+      f->ImplicitSolve(A_imp(stage, stage)*dt, y, k);
+      ks_imp.push_back(k);
+      y.Add(dt*A_imp(stage, stage), ks_imp[stage]);
+      f->SetTime(t);
+      f->SetEvalMode(TimeDependentOperator::ADDITIVE_TERM_1);
+      f->Mult(y, k);
+      ks_ex.push_back(k);
+      x.Add(dt*b_ex(stage+1), ks_ex[stage+1]);
+      x.Add(dt*b_imp(stage), ks_imp[stage]);
     }
     ks_ex.clear();
     ks_imp.clear();
-    lks_ex.clear();
-    lks_imp.clear();
-    dks_ex.clear();
-    dks_imp.clear();
-    x_stages.clear();
-    t += dt;  
+    t += dt;
 }
 
 class TopOptRKIMEXExpImplEuler : public TopOptRKIMEXSolver

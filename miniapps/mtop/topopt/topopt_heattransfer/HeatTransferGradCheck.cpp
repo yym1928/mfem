@@ -134,7 +134,7 @@ int main(int argc, char *argv[])
 
    // 5. Define the parallel mesh by a partitioning of the serial mesh. Refine
    //    this mesh further in parallel to increase the resolution. Once the
-   //    parallel mesh is defined, the serial mesh can be deleted.
+   //    parallel mesh is defined, the serial mesh can be deleted.           
    ParMesh *pmesh = new ParMesh(MPI_COMM_WORLD, *mesh);
    delete mesh;
    for (int lev = 0; lev < par_ref_levels; lev++)  
@@ -145,7 +145,7 @@ int main(int argc, char *argv[])
    // 6. Define the discontinuous DG finite element space of the given
    //    polynomial order on the refined mesh.
    FiniteElementCollection *fec = new DG_FECollection(order, dim, BasisType::GaussLobatto);
-   ParFiniteElementSpace *fes = new ParFiniteElementSpace(pmesh, fec);                                                    
+   ParFiniteElementSpace *fes = new ParFiniteElementSpace(pmesh, fec);                                                                
    HYPRE_BigInt global_vSize = fes->GlobalTrueVSize(); 
  
    H1_FECollection filter_fec(order, dim); 

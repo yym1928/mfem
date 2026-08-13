@@ -575,7 +575,7 @@ void IMEXAdvectionDiffusionSolver::ImplicitSolveDesignGradient(const real_t dt,V
       //lam A^{-1} dS/drho A^{-1} S q
       Vector k_d(dual_vector.Size()); 
       Vector y(dual_vector.Size());
-      Vector u(dual_vector.Size());
+      Vector u(x.Size());
       implicit_solver->Mult(dual_vector, w); // w = A^{-1} lam, A is self adjoint
       //Vector q_vec = trajectory->Get(current_step-1);
       M_mat->Mult(x, u);
@@ -613,7 +613,7 @@ void IMEXAdvectionDiffusionSolver::JacobianMult1Transpose(const Vector &lam, Vec
    K_mat->MultTranspose(z, lam_rhs);
 }
 
-void IMEXAdvectionDiffusionSolver::ExplicitMultDesignGradient(const real_t dt, Vector &dual_vector, Vector &x, Vector &dgdrho_tilde)
+void IMEXAdvectionDiffusionSolver::ExplicitMultDesignGradient(const real_t dt_pass, Vector &dual_vector, Vector &x, Vector &dgdrho_tilde)
 {
    // Update the design gradient
    M_solver->Mult(dual_vector, w);
@@ -639,7 +639,7 @@ void IMEXAdvectionDiffusionSolver::ExplicitMultDesignGradient(const real_t dt, V
       dom_flow_lf.Assemble();
       std::unique_ptr<HypreParVector> dom_flow_vec(dom_flow_lf.ParallelAssemble());
       //design_gradient.Add(-dt, *dom_flow_vec);
-      dgdrho_tilde.Add(-dt, *dom_flow_vec);
+      dgdrho_tilde.Add(-dt_pass, *dom_flow_vec);
    }
    else if (problem_type == 2)
    {
@@ -649,13 +649,13 @@ void IMEXAdvectionDiffusionSolver::ExplicitMultDesignGradient(const real_t dt, V
       adv_lf.AddInteriorFaceIntegrator(new DGAdvectionDesignLFIntegrator(rho_tilde, qq_gf, lam_gf, v_base, SIMP_cf));
       adv_lf.Assemble();
       std::unique_ptr<HypreParVector> adv_vec(adv_lf.ParallelAssemble());
-      dgdrho_tilde.Add(-dt, *adv_vec);
+      dgdrho_tilde.Add(-dt_pass, *adv_vec);
       //design_gradient.Add(-dt, *adv_vec);
       ParLinearForm bdr_flow_lf(filter_fes);
       bdr_flow_lf.AddBdrFaceIntegrator(new BdrFlowDesignLFIntegrator(rho_tilde, lam_gf, raw_inflow, v_base, SIMP_cf),inflow_bdr_attr);
       bdr_flow_lf.Assemble();
       std::unique_ptr<HypreParVector> bdr_flow_vec(bdr_flow_lf.ParallelAssemble());
-      dgdrho_tilde.Add(dt, *bdr_flow_vec);
+      dgdrho_tilde.Add(dt_pass, *bdr_flow_vec);
       //design_gradient.Add(dt, *bdr_flow_vec);
    }
    else{MFEM_ABORT("Unknown Problem Type (Design Gradient): " << problem_type);}
