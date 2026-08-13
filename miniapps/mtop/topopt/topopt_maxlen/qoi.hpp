@@ -133,6 +133,7 @@ class ThicknessResidual : public QuantityOfInterest
     Array<real_t> ds;           // segment length for each ray
     const Vector *alpha;        // per-ray thickness design variables (live, owned by caller)
     
+    real_t max_thickness;
     Vector ray_residuals;       // residuals (A_i - α_i)
     
     public:
@@ -176,11 +177,14 @@ class ThicknessResidual : public QuantityOfInterest
     }
     ~ThicknessResidual() { }
 
+    real_t GetMaxThickness() { return max_thickness; }
+
     // Compute total residual: ∑_i 1/2 (A_i - α_i)^2
     real_t Eval() override
     {
         finder.Interpolate(*rho_filter, interp_vals);
 
+        max_thickness = 0.0;
         real_t total_residual = 0.0;
 
         for (int r = 0; r < nrays; r++)
@@ -193,6 +197,8 @@ class ThicknessResidual : public QuantityOfInterest
                 if (code[idx] == 2) { continue; }   // skip points outside the mesh
                 thickness += interp_vals(idx) * ds[r];  // midpoint rule
             }
+
+            max_thickness = max(max_thickness, thickness);
 
             real_t res = thickness - (*alpha)(r);
             ray_residuals(r) = res;

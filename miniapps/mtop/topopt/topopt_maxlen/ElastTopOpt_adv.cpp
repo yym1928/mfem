@@ -404,7 +404,7 @@ int main(int argc, char *argv[])
     if (myid == 0)
     {
         csv.open("convergence.csv");
-        csv << "it,compliance,volume,res_thick,eps,iterErr\n";
+        csv << "it,c,volume,max_rho_a,max_alpha,fival_max,eps,beta,iterErr\n";
     }
 
     // 10. Optimization loop.
@@ -494,24 +494,14 @@ int main(int argc, char *argv[])
         dthick /= epsilon;
         dfidx[1] = dthick;                              // update constraint gradient
 
-        {
-            real_t local_max = advect.GetRhoA().Max();
-            real_t global_max = local_max;
-            MPI_Allreduce(&local_max, &global_max, 1, MPITypeMap<real_t>::mpi_type, MPI_MAX,
-                        advect.GetRhoA().ParFESpace()->GetComm());
+        // record max value of rho_a and alpha
+        real_t max_rho_a = advect.GetRhoA().Max();
+        MPI_Allreduce(MPI_IN_PLACE, &max_rho_a, 1, MPITypeMap<real_t>::mpi_type, MPI_MAX,
+                    advect.GetRhoA().ParFESpace()->GetComm());
 
-
-            real_t local_alpha_max = alpha.Max();
-            real_t global_alpha_max = local_alpha_max;
-            MPI_Allreduce(&local_alpha_max, &global_alpha_max, 1, MPITypeMap<real_t>::mpi_type, MPI_MAX,
-                        alpha.ParFESpace()->GetComm());
-            if (myid == 0)
-            {
-                mfem::out << "max rho_a = " << fixed << setprecision(8) << global_max 
-                        << ",    max alpha = " << fixed << setprecision(8) << global_alpha_max
-                        << ",    residual = " << scientific << setprecision(8) << fival(1) << endl;
-            }
-        }
+        real_t max_alpha = alpha.Max();
+        MPI_Allreduce(MPI_IN_PLACE, &max_alpha, 1, MPITypeMap<real_t>::mpi_type, MPI_MAX,
+                    alpha.ParFESpace()->GetComm());
 
         // (7) box constraints:  rho ∈ [0,1],  ɑ ∈ [alpha_min, alpha_max]  (move limits)
         alpha.GetTrueDofs(alpha_tv);
@@ -547,30 +537,35 @@ int main(int argc, char *argv[])
 
         if (myid == 0)
         {
-            const int w = 14;               // column width
-            mfem::out << "\niteration " << it << '\n' << left
+            const int w = 12;               // column width
+            mfem::out << "\nIteration " << it << '\n' << string(8*w, '=') << "\n\n" << left
                     << setw(w) << "c"
                     << setw(w) << "volume"
-                    << setw(w) << "res_thick"
+                    << setw(w) << "max_rho_a"
+                    << setw(w) << "max_alpha"
+                    << setw(w) << "fival_max"
                     << setw(w) << "eps"
-                    << setw(w) << "fival"
                     << setw(w) << "beta"
                     << setw(w) << "iterErr" << '\n'
-                    << string(7*w, '=') << '\n'
+                    << string(8*w, '-') << '\n'
                     << fixed      << setprecision(6) << setw(w) << compliance
                     <<               setprecision(4) << setw(w) << vol
-                    << scientific << setprecision(3) << setw(w) << thickres
-                    <<               setprecision(3) << setw(w) << epsilon
-                    <<               setprecision(3) << setw(w) << fival(1)
+                    <<               setprecision(4) << setw(w) << max_rho_a
+                    <<               setprecision(4) << setw(w) << max_alpha
+                    << scientific << setprecision(2) << setw(w) << fival(1)
+                    <<               setprecision(2) << setw(w) << epsilon
                     << fixed      << setprecision(0) << setw(w) << beta
-                    << scientific << setprecision(4) << setw(w) << iterationError << endl;
+                    << scientific << setprecision(2) << setw(w) << iterationError << endl;
 
             csv << it << ','
                 << scientific << setprecision(8) << compliance << ','
                 << vol << ','
-                << thickres << ','
+                << max_rho_a << ','
+                << max_alpha << ','
+                << fival(1) << ','
                 << epsilon << ','
-                << iterationError << '\n';
+                << fixed << setprecision(0) << beta << ','
+                << scientific << setprecision(8) << iterationError << '\n';
             csv.flush();
         }
 

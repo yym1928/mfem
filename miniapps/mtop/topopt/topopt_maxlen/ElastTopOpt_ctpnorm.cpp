@@ -562,7 +562,7 @@ int main(int argc, char *argv[])
     if (myid == 0)
     {
         csv.open("convergence.csv");
-        csv << "it,compliance,volume,pnorm,iterErr,iter_time\n";
+        csv << "it,c,volume,max_rho_a,pnorm_max,fival_max,beta,iterErr,iter_time\n";
     }
 
     // 10. Optimization loop.
@@ -609,6 +609,7 @@ int main(int argc, char *argv[])
         real_t compliance = 0.0;
         Vector adj_rhs_tv(nf);
         adj_rhs_tv = 0.0;
+        double elast_runtime = MPI_Wtime();
         for (int i = 0; i < n_elast_solve; i++)
         {
             elast[i]->Assemble();
@@ -622,6 +623,7 @@ int main(int argc, char *argv[])
             std::unique_ptr<HypreParVector> adj_rhs_e_tv(adj_rhs.ParallelAssemble());
             adj_rhs_tv += *adj_rhs_e_tv;
         }
+        elast_runtime = MPI_Wtime() - elast_runtime;
         compliance  /= n_elast_solve;
         adj_rhs_tv  /= n_elast_solve;
 
@@ -646,12 +648,17 @@ int main(int argc, char *argv[])
         //       dg_r/drho = M_fc^T N^T (dP_r/drho_a) / maxthick
         real_t pnorm_max = -infinity();
         real_t fi_thick  = -infinity();
+        real_t max_rho_a = -infinity();
+        Vector ray_rho_a(n_dir), ray_pnorm(n_dir);   // per-ray maxima, reduced below
+        double adv_runtime = MPI_Wtime();
         for (int r = 0; r < n_dir; r++)
         {
             advect[r]->SetRhs(rho_filter_tv);
             advect[r]->FSolve();
+            ray_rho_a(r) = advect[r]->GetRhoA().Max();   // local max, DG: no shared dofs
 
             const real_t pnorm_val = thick_qoi[r]->Eval();
+            ray_pnorm(r)  = pnorm_val;
             fival(1 + r) = pnorm_val / maxthick - 1.0;
 
             Vector dPdrhoa;
@@ -666,21 +673,14 @@ int main(int argc, char *argv[])
             pnorm_max = std::max(pnorm_max, pnorm_val);
             fi_thick  = std::max(fi_thick, fival(1 + r));
         }
+        adv_runtime = MPI_Wtime() - adv_runtime;
 
-        // printing max thickness per direction
-        for (int r = 0; r < n_dir; r++)
+        // global maxima for the per-ray table below
+        if (n_dir > 0)
         {
-            real_t local_max = advect[r]->GetRhoA().Max();
-            real_t global_max = local_max;
-            MPI_Allreduce(&local_max, &global_max, 1, MPITypeMap<real_t>::mpi_type, MPI_MAX,
-                        advect[r]->GetRhoA().ParFESpace()->GetComm());
-
-            if (myid == 0)
-            {
-                mfem::out << "ray direction [" << r << "]"
-                        << ":    max rho_a = " << fixed << setprecision(8) << global_max
-                        << ",    residual = " << scientific << setprecision(8) << fival[r+1] << endl;
-            }
+            MPI_Allreduce(MPI_IN_PLACE, ray_rho_a.GetData(), n_dir,
+                        MPITypeMap<real_t>::mpi_type, MPI_MAX, MPI_COMM_WORLD);
+            max_rho_a = ray_rho_a.Max();
         }
 
         // (6) box constraints:  rho ∈ [0,1]  (move limits)
@@ -709,35 +709,56 @@ int main(int argc, char *argv[])
 
         double iter_end_time = MPI_Wtime() - opt_start_time;
         double iter_runtime  = iter_end_time - iter_start_time;
+        double elapsed_time  = MPI_Wtime() - init_time;   // includes the setup block
 
         // (8) reporting
         if (myid == 0)
         {
-            const int w = 14;               // column width
-            mfem::out << "\niteration " << it << '\n' << left
+            const int w = 13;               // column width
+            mfem::out << "\nIteration " << it << '\n' << string(5*w, '=') << "\n\n" << left
+                    << setw(w) << "ray"
+                    << setw(w) << "max_rho_a"
+                    << setw(w) << "pnorm" << '\n'
+                    << string(3*w, '-') << '\n';
+            for (int r = 0; r < n_dir; r++)
+            {
+                mfem::out << setw(w) << r
+                        << fixed << setprecision(6) << setw(w) << ray_rho_a(r)
+                        <<          setprecision(6) << setw(w) << ray_pnorm(r) << '\n';
+            }
+
+            mfem::out << '\n' << left
                     << setw(w) << "c"
                     << setw(w) << "volume"
-                    << setw(w) << "pnorm_max"
                     << setw(w) << "fival_max"
                     << setw(w) << "beta"
                     << setw(w) << "iterErr" << '\n'
-                    << string(6*w, '=') << '\n'
-                    << fixed      << setprecision(6) << setw(w) << compliance
-                    <<               setprecision(4) << setw(w) << vol
-                    << scientific << setprecision(3) << setw(w) << pnorm_max
-                    <<               setprecision(3) << setw(w) << fi_thick
+                    << string(5*w, '-') << '\n'
+                    << fixed      << setprecision(8) << setw(w) << compliance
+                    <<               setprecision(6) << setw(w) << vol
+                    << scientific << setprecision(4) << setw(w) << fi_thick
                     << fixed      << setprecision(0) << setw(w) << beta
-                    << scientific << setprecision(4) << setw(w) << iterationError << '\n'
-                    << "iteration runtime: " << fixed << setprecision(2)
-                    << iter_runtime << " s,   elapsed time at end: "
-                    << iter_end_time << " s" << endl;
+                    << scientific << setprecision(4) << setw(w) << iterationError << "\n\n";
+
+            // runtime outputs
+            const int lw = 18;              // label width
+            mfem::out << fixed << setprecision(2) << left
+                    << setw(lw) << "elast solve"     << right << setw(8) << elast_runtime << " s\n" << left
+                    << setw(lw) << "advection solve" << right << setw(8) << adv_runtime   << " s\n" << left
+                    << setw(lw) << "iteration"       << right << setw(8) << iter_runtime  << " s\n" << left
+                    << setw(lw) << "total elapsed"   << right << setw(8) << elapsed_time  << " s   "
+                    << setprecision(0) << floor(elapsed_time/3600) << "h "
+                    << fmod(floor(elapsed_time/60), 60) << "m" << endl;
 
             csv << it << ','
                 << scientific << setprecision(8) << compliance << ','
                 << vol << ','
+                << max_rho_a << ','
                 << pnorm_max << ','
-                << iterationError << ','
-                << iter_runtime << '\n';
+                << fi_thick << ','
+                << fixed << setprecision(0) << beta << ','
+                << scientific << setprecision(8) << iterationError << ','
+                << fixed << setprecision(4) << iter_runtime << '\n';
             csv.flush();
         }
 
@@ -775,12 +796,13 @@ int main(int argc, char *argv[])
                 << "solution\n" << design_domain << rho_filter << flush;
         }
 
-        // if (paraview)
-        // {
-        //     paraview_dc.SetCycle(it);
-        //     paraview_dc.SetTime(it);
-        //     paraview_dc.Save();
-        // }
+        // save every 50 iterations
+        if (paraview && it % 50 == 0)
+        {
+            paraview_dc.SetCycle(it);
+            paraview_dc.SetTime(it);
+            paraview_dc.Save();
+        }
     }
 
     double total_runtime = MPI_Wtime() - init_time;
@@ -792,7 +814,7 @@ int main(int argc, char *argv[])
                   << "\ntotal runtime is " << total_runtime << " s\n";
     }
 
-    // Option: save only the final solution instead of all iterations
+    // save the final solution
     if (paraview)
     {
         paraview_dc.SetCycle(it - 1);

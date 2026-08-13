@@ -347,7 +347,7 @@ int main(int argc, char *argv[])
     if (myid == 0)
     {
         csv.open("convergence.csv");
-        csv << "it,compliance,volume,res_thick,eps,iterErr\n";
+        csv << "it,c,volume,max_thick,max_alpha,fival_max,eps,beta,iterErr\n";
     }
 
     // 10. Optimization loop.
@@ -403,6 +403,10 @@ int main(int argc, char *argv[])
         //     residuals that the gradients below reuse, so it must come first.
         real_t thickres = thickness_qoi.Eval();
 
+        // record max value of the thickness measure and alpha (pre MMA update)
+        real_t max_thick = thickness_qoi.GetMaxThickness();
+        real_t max_alpha = alpha.Max();
+
         // (6) max-thickness constraint and gradient:  1/(2N) ∑(A_i−α_i)² − ε ≤ 0
         //     dR/drho   = M_fc^T (r_f^2 K + M)^{-1} ℓ,  ℓ = Σ_i (A_i−α_i) ds_i Σ_k φ(x_ik)
         //     dR/dalpha = -(A_i − α_i)/N
@@ -449,30 +453,35 @@ int main(int argc, char *argv[])
 
         if (myid == 0)
         {
-            const int w = 14;               // column width
-            mfem::out << "\niteration " << it << '\n' << left
+            const int w = 12;               // column width
+            mfem::out << "\nIteration " << it << '\n' << string(8*w, '=') << "\n\n" << left
                     << setw(w) << "c"
                     << setw(w) << "volume"
-                    << setw(w) << "res_thick"
+                    << setw(w) << "max_thick"
+                    << setw(w) << "max_alpha"
+                    << setw(w) << "fival_max"
                     << setw(w) << "eps"
-                    << setw(w) << "fival"
                     << setw(w) << "beta"
                     << setw(w) << "iterErr" << '\n'
-                    << string(7*w, '=') << '\n'
+                    << string(8*w, '-') << '\n'
                     << fixed      << setprecision(6) << setw(w) << compliance
                     <<               setprecision(4) << setw(w) << vol
-                    << scientific << setprecision(3) << setw(w) << thickres
-                    <<               setprecision(3) << setw(w) << epsilon
-                    <<               setprecision(3) << setw(w) << fival(1)
+                    <<               setprecision(4) << setw(w) << max_thick
+                    <<               setprecision(4) << setw(w) << max_alpha
+                    << scientific << setprecision(2) << setw(w) << fival(1)
+                    <<               setprecision(2) << setw(w) << epsilon
                     << fixed      << setprecision(0) << setw(w) << beta
-                    << scientific << setprecision(4) << setw(w) << iterationError << endl;
+                    << scientific << setprecision(2) << setw(w) << iterationError << endl;
 
             csv << it << ','
                 << scientific << setprecision(8) << compliance << ','
                 << vol << ','
-                << thickres << ','
+                << max_thick << ','
+                << max_alpha << ','
+                << fival(1) << ','
                 << epsilon << ','
-                << iterationError << '\n';
+                << fixed << setprecision(0) << beta << ','
+                << scientific << setprecision(8) << iterationError << '\n';
             csv.flush();
         }
 
