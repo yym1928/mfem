@@ -135,6 +135,7 @@ void MaterialThicknessSolver::AssembleLinearSolver()
     fwd_gmres->SetRelTol(1e-12);
     fwd_gmres->SetAbsTol(1e-14);
     fwd_gmres->SetMaxIter(2000);
+    fwd_gmres->SetPrintLevel(0);
     fwd_gmres->SetKDim(50);
 
     Kt = std::make_unique<TransposeOperator>(*Kopt);
@@ -147,6 +148,7 @@ void MaterialThicknessSolver::AssembleLinearSolver()
     adj_gmres->SetRelTol(1e-12);
     adj_gmres->SetAbsTol(1e-14);
     adj_gmres->SetMaxIter(2000);
+    adj_gmres->SetPrintLevel(0);
     adj_gmres->SetKDim(50);
 }
 
@@ -207,6 +209,26 @@ void MaterialThicknessSolver::MultTranspose(const Vector &x, Vector &y) const
         ParSubMesh::Transfer(sens_eval_gf, y_gf);
         y_gf.GetTrueDofs(y);
     }
+}
+   
+void MaterialThicknessSolver::LinearFSolve()
+{
+    MFEM_VERIFY(fwd_rhs.Size() == design_fes->GetTrueVSize(),
+                "MaterialThicknessSolver: rhs is not set (or wrong size)");
+
+    Vector ra_tv(sol_fes->GetTrueVSize());
+    Mult(fwd_rhs, ra_tv);
+    
+    rho_a.SetFromTrueDofs(ra_tv);
+}
+
+void MaterialThicknessSolver::LinearASolve()
+{
+    MFEM_VERIFY(adj_rhs.Size() == sol_fes->GetTrueVSize(),
+                "MaterialThicknessSolver: adjoint rhs is not set (or wrong size)");
+
+    sens_tv.SetSize(design_fes->GetTrueVSize());
+    MultTranspose(adj_rhs, sens_tv);
 }
 
 void MaterialThicknessSolver::FSolve()

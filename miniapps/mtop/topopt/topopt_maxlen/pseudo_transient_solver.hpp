@@ -168,6 +168,10 @@ public:
     void Mult(const Vector &x, Vector &y) const override;
     void MultTranspose(const Vector &x, Vector &y) const override;
 
+    // LinearFSolve() and LinearAsolve() uses GMRES
+    void LinearFSolve();
+    void LinearASolve();
+
     // FSolve() and Asolve() uses the pseudoTransientSovler
     void FSolve();
     void ASolve();

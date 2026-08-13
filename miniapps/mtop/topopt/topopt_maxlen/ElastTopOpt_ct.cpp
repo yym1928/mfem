@@ -43,7 +43,8 @@ struct RaySpec
 {
     RaySet parallel;
     RaySet cone;
-    real_t half_ang = M_PI / 12;   // cone half-opening angle (15 deg -> 30 deg cone)
+    real_t half_ang = M_PI / 12;    // cone half-opening angle (15 deg -> 30 deg cone)
+    real_t dom_h = 1.05;            // cone half angle height
 };
 
 // Full problem definition for one mesh
@@ -387,7 +388,7 @@ int main(int argc, char *argv[])
     vector<unique_ptr<MaterialThicknessSolver>> advect(n_dir);
     DGMassInverse minv(dgfes);
 
-    real_t cfl = 0.5;
+    real_t cfl = 1.0;
     real_t hmin = infinity();
     for (int i = 0; i < pmesh.GetNE(); i++)
     {
@@ -400,9 +401,10 @@ int main(int argc, char *argv[])
     for (int r = 0; r < n_dir; r++)
     {
         advect[r] = make_unique<MaterialThicknessSolver>(filter_fes, dgfes, *ray_cf[r], pa);
-        advect[r]->SetMinv(minv);
-        advect[r]->GetSolver().SetTimeStep(dt);      // pseudo-transient time step
-        advect[r]->GetSolver().SetTerminalTime(3);
+        // advect[r]->SetMinv(minv);
+        // advect[r]->GetSolver().SetTimeStep(dt);      // pseudo-transient time step
+        // advect[r]->GetSolver().SetTerminalTime(3);
+        advect[r]->AssembleLinearSolver();
     }
 
     // 7. Construct the quantity of interest objects
@@ -703,7 +705,7 @@ int main(int argc, char *argv[])
         for (int r = 0; r < n_dir; r++)
         {
             advect[r]->SetRhs(rho_filter_tv);
-            advect[r]->FSolve();
+            advect[r]->LinearFSolve();
             ray_rho_a(r) = advect[r]->GetRhoA().Max();   // local max, DG: no shared dofs
             ray_alpha(r) = alpha[r]->Max();
 
@@ -723,7 +725,7 @@ int main(int argc, char *argv[])
 
             // chain rule adjoint solve: dG/drho = M_fc^T N^T g
             advect[r]->SetAdjointRhs(rhs_full);
-            advect[r]->ASolve();
+            advect[r]->LinearASolve();
             filter.MultTranspose(advect[r]->GetSensitivity(), dthick[r].GetBlock(0));
 
             fival(1 + r) = thickres / epsilon - 1.0;     // update constraint value
@@ -796,7 +798,7 @@ int main(int argc, char *argv[])
                     << string(4*w, '-') << '\n';
             for (int r = 0; r < n_dir; r++)
             {
-                mfem::out << setw(w) << r
+                mfem::out << setw(w) << r+1
                         << fixed      << setprecision(6) << setw(w) << ray_rho_a(r)
                         << setprecision(6) << setw(w) << ray_alpha(r)
                         << scientific << setprecision(4) << setw(w) << ray_res(r) << '\n';
@@ -941,7 +943,7 @@ std::unique_ptr<VectorCoefficient> MakeRayCoeff(RayMode mode, const RaySpec &spe
         return std::make_unique<VectorConstantCoefficient>(axis);
     }
 
-    const real_t R = 1.1 / tan(spec.half_ang);
+    const real_t R = spec.dom_h / sin(spec.half_ang);
     Vector src(axis); src *= -R;
     auto field = [src, dim](const Vector &x, Vector &d)
     {
@@ -991,6 +993,8 @@ static MeshProblem SetupSquare4Holes(Mesh &mesh, const char *mesh_file)
     p.outer_bdr_attrs = Array<int>({1, 2, 3, 4});
     p.rays.parallel = { 4, M_PI,     0.0 };
     p.rays.cone     = { 8, 2 * M_PI, 0.0 };
+    p.rays.half_ang = M_PI / 4;
+    p.rays.dom_h    = 0.8;
 
     p.cases.resize(2);
 
