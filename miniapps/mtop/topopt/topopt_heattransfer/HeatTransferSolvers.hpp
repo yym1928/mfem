@@ -9,7 +9,6 @@
 #include <iostream>
 #include "ObjFunc.hpp"     // TimeIntegratedObjective (J, dJ/du)
 #include "HeatTransferLinForms.hpp"
-#include "HeatTransferTopOpt.hpp"
 #include "../../pde_filter.hpp"
 
 namespace mfem
@@ -231,8 +230,10 @@ class IMEXAdvectionDiffusionSolver : public TimeDependentOperator
     void InitializeFlowProblem();
     void Mult1(const Vector &x, Vector &y) const;
     void ImplicitSolve2(const real_t dt, const Vector &x, Vector &k);
-    void JacobianMult1Transpose(const Vector &lam, Vector &lam_rhs, Vector &x) const;
-    void AdjointImplicitSolve2(const real_t dt, const Vector &lam, Vector &x, Vector &k);
+    void JacobianMult1Transpose(const Vector &lam, Vector &lam_rhs) const;
+    void ExplicitMultDesignGradient(const real_t dt, Vector &dual_vector, Vector &x, Vector &dgdrho_tilde);
+    void ImplicitSolveDesignGradient(const real_t dt, Vector &dual_vector, Vector &x, Vector &dfdrho_tilde); 
+    void AdjointImplicitSolve2(const real_t dt, const Vector &lam, Vector &k);
     void Mult(const Vector &x, Vector &y) const override
     {
         Mult1(x,y);
@@ -241,13 +242,13 @@ class IMEXAdvectionDiffusionSolver : public TimeDependentOperator
     {
         ImplicitSolve2(dt_pass,x,k);
     }
-    void AdjointMult(const Vector &lam, Vector &lam_rhs, Vector &x) const
+    void AdjointMult(const Vector &lam, Vector &lam_rhs) const
     {
-        JacobianMult1Transpose(lam, lam_rhs, x);
+        JacobianMult1Transpose(lam, lam_rhs);
     }
-    void AdjointImplicitSolve(const real_t dt_pass, const Vector &lam, Vector &x,  Vector &k) 
+    void AdjointImplicitSolve(const real_t dt_pass, const Vector &lam, Vector &k) 
     {
-        AdjointImplicitSolve2(dt_pass,lam,x,k);
+        AdjointImplicitSolve2(dt_pass,lam,k);
     }
 
 
@@ -521,14 +522,14 @@ void IMEXAdvectionDiffusionSolver::Mult1(const Vector &x, Vector &y) const
    z += *b_vec;
    M_solver->Mult(z, y);
 
-   raw_inflow.SetTime(t);
-   GridFunctionCoefficient rho_til_cf(&rho_tilde);
-   ProductCoefficient inflow(rho_til_cf, raw_inflow);
-   //b->Update();
-   b = new ParLinearForm(fespace);
-   b->AddDomainIntegrator(new DomainLFIntegrator(inflow));
-   b->Assemble();
-   b_vec.reset(b->ParallelAssemble());
+   // raw_inflow.SetTime(t);
+   // GridFunctionCoefficient rho_til_cf(&rho_tilde);
+   // ProductCoefficient inflow(rho_til_cf, raw_inflow);
+   // //b->Update();
+   // b = new ParLinearForm(fespace);
+   // b->AddDomainIntegrator(new DomainLFIntegrator(inflow));
+   // b->Assemble();
+   // b_vec.reset(b->ParallelAssemble());
 }
 
 void IMEXAdvectionDiffusionSolver::ImplicitSolve2(const real_t dt_pass, const Vector &x, Vector &k)
@@ -540,13 +541,14 @@ void IMEXAdvectionDiffusionSolver::ImplicitSolve2(const real_t dt_pass, const Ve
 
    int myrank;
    MPI_Comm_rank(comm, &myrank);
+   z = 0.0;
    S_mat->Mult(x, z);
    z *= -1.0;
    implicit_solver->SetTimeStep(dt_pass);
    implicit_solver->Mult(z, k);
 }
 
-void IMEXAdvectionDiffusionSolver::AdjointImplicitSolve2(const real_t dt_pass, const Vector &lam, Vector &x, Vector &k)
+void IMEXAdvectionDiffusionSolver::AdjointImplicitSolve2(const real_t dt_pass, const Vector &lam, Vector &k)
 {
    // Perform the implicit step
    // solve for k, k = -(M+dt S)^{-1} S x
@@ -557,17 +559,24 @@ void IMEXAdvectionDiffusionSolver::AdjointImplicitSolve2(const real_t dt_pass, c
    implicit_solver->Mult(lam, z);
    z *= -1.0;
    S_mat->Mult(z, k);
+}
+
+void IMEXAdvectionDiffusionSolver::ImplicitSolveDesignGradient(const real_t dt,Vector &dual_vector, Vector &x, Vector &dfdrho_tilde)
+{
+   MFEM_VERIFY(implicit_solver != NULL, "Implicit time integration is not supported with partial assembly");
+   implicit_solver->SetTimeStep(dt);
    if (problem_type == 1)
    {
+      dfdrho_tilde = 0.0;
       // No dependence on rho, do nothing.
    }
    else if (problem_type == 2)
    { 
       //lam A^{-1} dS/drho A^{-1} S q
-      Vector k_d(lam.Size()); 
-      Vector y(lam.Size());
-      Vector u(lam.Size());
-      implicit_solver->Mult(lam, w); // w = A^{-1} lam, A is self adjoint
+      Vector k_d(dual_vector.Size()); 
+      Vector y(dual_vector.Size());
+      Vector u(dual_vector.Size());
+      implicit_solver->Mult(dual_vector, w); // w = A^{-1} lam, A is self adjoint
       //Vector q_vec = trajectory->Get(current_step-1);
       M_mat->Mult(x, u);
       implicit_solver->Mult(u, y); // y = A^{-1}S q
@@ -583,14 +592,15 @@ void IMEXAdvectionDiffusionSolver::AdjointImplicitSolve2(const real_t dt_pass, c
       stiff_lf1.AddInteriorFaceIntegrator(new DGStiffnessDesignLFIntegrator(rho_tilde, y_gf, w_gf, raw_diff_term, kappa, SIMP_cf));
       stiff_lf1.Assemble();
       std::unique_ptr<HypreParVector> stiff_vec1(stiff_lf1.ParallelAssemble());    
-      design_gradient.Add(dt, *stiff_vec1); 
+      dfdrho_tilde.Add(1.0, *stiff_vec1);
+      // design_gradient.Add(dt, *stiff_vec1); 
    }
    else{MFEM_ABORT("Unknown Problem Type (Design Gradient): " << problem_type);}
 }
 
 
 
-void IMEXAdvectionDiffusionSolver::JacobianMult1Transpose(const Vector &lam, Vector &lam_rhs, Vector &x) const
+void IMEXAdvectionDiffusionSolver::JacobianMult1Transpose(const Vector &lam, Vector &lam_rhs) const
 {
    // Plain transpose of the forward RHS Jacobian:
    // G(u) = M^{-1} (K u + b)
@@ -601,9 +611,12 @@ void IMEXAdvectionDiffusionSolver::JacobianMult1Transpose(const Vector &lam, Vec
    z = 0.0;
    M_solver->Mult(lam, z);
    K_mat->MultTranspose(z, lam_rhs);
+}
 
+void IMEXAdvectionDiffusionSolver::ExplicitMultDesignGradient(const real_t dt, Vector &dual_vector, Vector &x, Vector &dgdrho_tilde)
+{
    // Update the design gradient
-   M_solver->Mult(lam, w);
+   M_solver->Mult(dual_vector, w);
    // Vector q_vec = trajectory->Get(current_step-1);
    // std::cout<<"current step = "<<current_step << std::endl;
    // Vector wf(filter_fes->GetTrueVSize()), qf(filter_fes->GetTrueVSize());
@@ -625,7 +638,8 @@ void IMEXAdvectionDiffusionSolver::JacobianMult1Transpose(const Vector &lam, Vec
       dom_flow_lf.AddDomainIntegrator(new DomainDesignLFIntegrator(lam_gf, raw_inflow));
       dom_flow_lf.Assemble();
       std::unique_ptr<HypreParVector> dom_flow_vec(dom_flow_lf.ParallelAssemble());
-      design_gradient.Add(-dt, *dom_flow_vec);
+      //design_gradient.Add(-dt, *dom_flow_vec);
+      dgdrho_tilde.Add(-dt, *dom_flow_vec);
    }
    else if (problem_type == 2)
    {
@@ -635,513 +649,239 @@ void IMEXAdvectionDiffusionSolver::JacobianMult1Transpose(const Vector &lam, Vec
       adv_lf.AddInteriorFaceIntegrator(new DGAdvectionDesignLFIntegrator(rho_tilde, qq_gf, lam_gf, v_base, SIMP_cf));
       adv_lf.Assemble();
       std::unique_ptr<HypreParVector> adv_vec(adv_lf.ParallelAssemble());
-      design_gradient.Add(-dt, *adv_vec);
+      dgdrho_tilde.Add(-dt, *adv_vec);
+      //design_gradient.Add(-dt, *adv_vec);
       ParLinearForm bdr_flow_lf(filter_fes);
       bdr_flow_lf.AddBdrFaceIntegrator(new BdrFlowDesignLFIntegrator(rho_tilde, lam_gf, raw_inflow, v_base, SIMP_cf),inflow_bdr_attr);
       bdr_flow_lf.Assemble();
       std::unique_ptr<HypreParVector> bdr_flow_vec(bdr_flow_lf.ParallelAssemble());
-      design_gradient.Add(dt, *bdr_flow_vec);
+      dgdrho_tilde.Add(dt, *bdr_flow_vec);
+      //design_gradient.Add(dt, *bdr_flow_vec);
    }
+   else{MFEM_ABORT("Unknown Problem Type (Design Gradient): " << problem_type);}
 }
 
-// =============================================================================
-// IMEX ODESolvers for Design Opt
-// =============================================================================
-// Note, Time dependent operator f must have adjointmult
+// // =============================================================================
+// // IMEX ODESolvers for Design Opt
+// // =============================================================================
+// // Note, Time dependent operator f must have adjointmult
 
-class TopOptIMEXSolver : public ODESolver
-{
-protected:
-   IMEXAdvectionDiffusionSolver *f;
-public:
-   virtual void Init(IMEXAdvectionDiffusionSolver &f_) = 0;
-   virtual void AdjointStep(Vector &lam, real_t &t, real_t &dt, Vector &x) = 0;
-   virtual void Step(Vector &x, real_t &t, real_t &dt) = 0;
-   // virtual ~TopOptIMEXSolver();
-};
+// class TopOptIMEXSolver : public ODESolver
+// {
+// protected:
+//    IMEXAdvectionDiffusionSolver *f;
+// public:
+//    virtual void Init(IMEXAdvectionDiffusionSolver &f_) = 0;
+//    virtual void AdjointStep(Vector &lam, real_t &t, real_t &dt, Vector &x) = 0;
+//    virtual void Step(Vector &x, real_t &t, real_t &dt) = 0;
+//    // virtual ~TopOptIMEXSolver();
+// };
 
-void TopOptIMEXSolver::Init(IMEXAdvectionDiffusionSolver &f_)
-{
-   this->f = &f_;
-   mem_type = GetMemoryType(f_.GetMemoryClass());
-}
-
-
-class TopOptIMEXExpImplEuler : public TopOptIMEXSolver
-{
-private:
-   Vector k1; Vector k2;
-public:
-   void Init(IMEXAdvectionDiffusionSolver &f_) override;
-
-   void Step(Vector &x, real_t &t, real_t &dt) override;
-
-   void AdjointStep(Vector &lam, real_t &t, real_t &dt, Vector &x) override;
-};
-
-void TopOptIMEXExpImplEuler::Init(IMEXAdvectionDiffusionSolver &f_)
-{
-   TopOptIMEXSolver::Init(f_);
-   int n = f->Width();
-   k1.SetSize(n, mem_type);
-   k2.SetSize(n, mem_type);
-}
-
-void TopOptIMEXExpImplEuler::Step(Vector &x, real_t &t, real_t &dt)
-{
-   f->SetTime(t);
-   f->Mult(x, k1);
-
-   f->SetTime(t+dt);
-   f->ImplicitSolve(dt, x, k2);
-
-   f->SetTime(t);
-   x.Add(dt, k1);
-   x.Add(dt, k2);
-   t += dt;
-}
-
-void TopOptIMEXExpImplEuler::AdjointStep(Vector &lam, real_t &t, real_t &dt, Vector &x)
-{
-   f->SetTime(t);
-   f->AdjointMult(lam, k1, x);
-
-   f->SetTime(t+dt);
-   f->AdjointImplicitSolve(dt, lam, x, k2);
-
-   f->SetTime(t);
-   lam.Add(dt, k1);
-   lam.Add(dt, k2);
-   t += dt;
-}
-
-/// Second order, two-stage implicit-explicit (IMEX) Runge-Kutta (RK) method
-/** L-stable IMEX RK2 method adopted from "On the Stability of IMEX Upwind gSBP
-    Schemes for 1D Linear Advection‑Difusion Equations" by Sigrun Ortleb. Same
-    as (2,2,2) from "Implicit-explicit Runge-Kutta methods for time-dependent
-    partial differential equations" by Ascher, Ruuth and Spiteri, Applied
-    Numerical Mathematics (1997). */
-class TopOptIMEXRK2 : public TopOptIMEXSolver
-{
-private:
-   Vector k1_exp; Vector k2_exp; Vector k_imp;
-   //helper vector
-   Vector y;
-public:
-   void Init(IMEXAdvectionDiffusionSolver &f_) override;
-
-   void Step(Vector &x, real_t &t, real_t &dt) override;
-
-   void AdjointStep(Vector &lam, real_t &t, real_t &dt, Vector &x) override;
-};
-
-void TopOptIMEXRK2::Init(IMEXAdvectionDiffusionSolver &f_)
-{
-   TopOptIMEXSolver::Init(f_);
-   int n = f->Width();
-   k1_exp.SetSize(n, mem_type);
-   k2_exp.SetSize(n, mem_type);
-   k_imp.SetSize(n, mem_type);
-   y.SetSize(n, mem_type);
-}
-
-void TopOptIMEXRK2::Step(Vector &x, real_t &t, real_t &dt)
-{
-   double gamma = 1 - sqrt(2)/2;
-   double delta = 1 - 1/(2*gamma);
-
-   f->SetTime(t);
-
-   //K1 exp is just f_1(t, x)
-   f->Mult(x, k1_exp);
-
-   //K2 exp is f_1(t + gamma dt, x + dt gamma K1)
-   f->SetTime(t + gamma*dt);
-   add(x, dt*gamma, k1_exp, y);
-   f->Mult(y, k2_exp);
-
-   //K2_imp = f_2(t + gamma dt, x + dt gamma K2_imp)
-   f->ImplicitSolve(dt*gamma, x, k_imp);
-   //reuse k_imp to avoid extra vector
-
-   //K3_imp = f_2(t+dt,x + dt(1-gamma)K2_imp + dt gamma K3_imp)
-   f -> SetTime(t + dt);
-   //add(x, dt*(1-gamma), k2_imp, z);
-   //optimization to avoid extra vector
-   x.Add(dt*(1-gamma), k_imp);
-   //f->ImplicitSolve(dt*gamma, z, k3_imp);
-   //reuse k_imp to avoid extra vector
-   f->ImplicitSolve(dt*gamma, x, k_imp);
-
-   //add it all up
-   f->SetTime(t);
-   x.Add(dt*delta, k1_exp);
-   x.Add(dt*(1-delta), k2_exp);
-   //x.Add(dt*(1-gamma), k2_imp); it is already added to x above
-   x.Add(dt*gamma, k_imp);
-   t += dt;
-}
-
-void TopOptIMEXRK2::AdjointStep(Vector &lam, real_t &t, real_t &dt, Vector &x)
-{
-   double gamma = 1 - sqrt(2)/2;
-   double delta = 1 - 1/(2*gamma);
-   int n = lam.Size();
-
-   f->SetTime(t);
-
-   Vector x1(n), x2(n), x3(n), ys(n), yi(n), x4(n);
-   f->Mult(x, x1);
-
-   //K2 exp is f_1(t + gamma dt, x + dt gamma K1)
-   f->SetTime(t + gamma*dt);
-   add(x, dt*gamma, k1_exp, ys);
-   f->UpdateDt(gamma*dt);
-   f->Mult(ys, x2);
-   f->UpdateDt(dt);
-
-   //K2_imp = f_2(t + gamma dt, x + dt gamma K2_imp)
-   f->ImplicitSolve(dt*gamma, x, x3);
-   //reuse k_imp to avoid extra vector
-
-   //K3_imp = f_2(t+dt,x + dt(1-gamma)K2_imp + dt gamma K3_imp)
-   f -> SetTime(t + dt);
-   //add(x, dt*(1-gamma), k2_imp, z);
-   //optimization to avoid extra vector
-   add(x, dt*(1-gamma), x3, yi);
-   //f->ImplicitSolve(dt*gamma, z, k3_imp);
-   //reuse k_imp to avoid extra vector
-   f->ImplicitSolve(dt*gamma, yi, x4);
-
-   /////////////////////////////
-
-   //K1 exp is just f_1(t, x)
-   f->UpdateDt(delta*dt);
-   f->AdjointMult(lam, k1_exp, x);
-
-   //K2 exp is f_1(t + gamma dt, x + dt gamma K1)
-   f->SetTime(t + gamma*dt);
-   add(lam, dt*gamma, k1_exp, y);
-   f->UpdateDt((1-delta)*dt);
-   f->AdjointMult(y, k2_exp, x);
-   // f->UpdateDt(dt);
-
-   //K2_imp = f_2(t + gamma dt, x + dt gamma K2_imp)
-   f->UpdateDt((1-gamma)*dt);
-   f->AdjointImplicitSolve(dt*gamma, lam, x, k_imp);
-   //reuse k_imp to avoid extra vector
-
-   //K3_imp = f_2(t+dt,x + dt(1-gamma)K2_imp + dt gamma K3_imp)
-   f -> SetTime(t + dt);
-   //add(x, dt*(1-gamma), k2_imp, z);
-   //optimization to avoid extra vector
-   lam.Add(dt*(1-gamma), k_imp);
-   //f->ImplicitSolve(dt*gamma, z, k3_imp);
-   //reuse k_imp to avoid extra vector
-   f->UpdateDt(gamma*dt);
-   f->AdjointImplicitSolve(dt*(gamma), lam, yi, k_imp);
-   f->UpdateDt(dt);
-
-   f->SetTime(t);
-
-   //add it all up
-   lam.Add(dt*delta, k1_exp);
-   lam.Add(dt*(1.0-delta), k2_exp);
-   //x.Add(dt*(1-gamma), k2_imp); it is already added to x above
-   lam.Add(dt*gamma, k_imp);
-   t += dt;
-}
+// void TopOptIMEXSolver::Init(IMEXAdvectionDiffusionSolver &f_)
+// {
+//    this->f = &f_;
+//    mem_type = GetMemoryType(f_.GetMemoryClass());
+// }
 
 
+// class TopOptIMEXExpImplEuler : public TopOptIMEXSolver
+// {
+// private:
+//    Vector k1; Vector k2;
+// public:
+//    void Init(IMEXAdvectionDiffusionSolver &f_) override;
 
-std::unique_ptr<TopOptIMEXSolver> SelectDesignOptIMEX(const int ode_solver_type)
-{
-   using ode_ptr = std::unique_ptr<TopOptIMEXSolver>;
-   switch (ode_solver_type)
-   {
-      // L-stable IMEX methods for design opt
-      case 1: return ode_ptr(new TopOptIMEXExpImplEuler);
-      case 2: return ode_ptr(new TopOptIMEXRK2);
+//    void Step(Vector &x, real_t &t, real_t &dt) override;
 
-      default: MFEM_ABORT("Unknown ODE solver type: " << ode_solver_type );
-   }
-}
+//    void AdjointStep(Vector &lam, real_t &t, real_t &dt, Vector &x) override;
+// };
 
-class DesignSolver
-{
-   private:
-   // Finite Element Spaces
-   ParFiniteElementSpace state_fes;
-   ParFiniteElementSpace filter_fes;
-   ParFiniteElementSpace control_fes;
-   IMEXAdvectionDiffusionSolver *oper;
-   std::vector<Vector> states;
-   std::vector<real_t> times;
+// void TopOptIMEXExpImplEuler::Init(IMEXAdvectionDiffusionSolver &f_)
+// {
+//    TopOptIMEXSolver::Init(f_);
+//    int n = f->Width();
+//    k1.SetSize(n, mem_type);
+//    k2.SetSize(n, mem_type);
+// }
 
-   // Design Optimization
-   toopt::PDEFilter &filter;
-   HeatTransferObjectiveFunction &objective;
-   Vector dJ_drho_tilde;
-   SIMPCoefficient SIMP_cf;
+// void TopOptIMEXExpImplEuler::Step(Vector &x, real_t &t, real_t &dt)
+// {
+//    f->SetTime(t);
+//    f->Mult(x, k1);
 
-   // Boundary Conditions
-   Array<int> ess_tdof_list;
-   Array<int> ess_bdr_attr;
-   Array<int> inflow_bdr;
+//    f->SetTime(t+dt);
+//    f->ImplicitSolve(dt, x, k2);
 
-   // PDE Coefficients
-   VectorFunctionCoefficient v_base;
-   real_t dt_diff_term;
-   FunctionCoefficient raw_inflow;
-   real_t raw_diff_term;
+//    f->SetTime(t);
+//    x.Add(dt, k1);
+//    x.Add(dt, k2);
+//    t += dt;
+// }
 
-   // Time Integration 
-   int nsteps;
-   real_t dt;
-   real_t t_final;
-   ParGridFunction &rho;         // working density (also the driver's ParaView field)
-   ParGridFunction &rho_tilde;   // filtered density
-   GridFunctionCoefficient q0;          // initial condition
-   ParGridFunction q_gf;
-   HypreParVector *q_vec;
+// void TopOptIMEXExpImplEuler::AdjointStep(Vector &lam, real_t &t, real_t &dt, Vector &x)
+// {
+//    f->SetTime(t);
+//    f->AdjointMult(lam, k1, x);
 
-   bool paraview_vis;
+//    f->SetTime(t+dt);
+//    f->AdjointImplicitSolve(dt, lam, x, k2);
+
+//    f->SetTime(t);
+//    lam.Add(dt, k1);
+//    lam.Add(dt, k2);
+//    t += dt;
+// }
+
+// /// Second order, two-stage implicit-explicit (IMEX) Runge-Kutta (RK) method
+// /** L-stable IMEX RK2 method adopted from "On the Stability of IMEX Upwind gSBP
+//     Schemes for 1D Linear Advection‑Difusion Equations" by Sigrun Ortleb. Same
+//     as (2,2,2) from "Implicit-explicit Runge-Kutta methods for time-dependent
+//     partial differential equations" by Ascher, Ruuth and Spiteri, Applied
+//     Numerical Mathematics (1997). */
+// class TopOptIMEXRK2 : public TopOptIMEXSolver
+// {
+// private:
+//    Vector k1_exp; Vector k2_exp; Vector k_imp;
+//    //helper vector
+//    Vector y;
+// public:
+//    void Init(IMEXAdvectionDiffusionSolver &f_) override;
+
+//    void Step(Vector &x, real_t &t, real_t &dt) override;
+
+//    void AdjointStep(Vector &lam, real_t &t, real_t &dt, Vector &x) override;
+// };
+
+// void TopOptIMEXRK2::Init(IMEXAdvectionDiffusionSolver &f_)
+// {
+//    TopOptIMEXSolver::Init(f_);
+//    int n = f->Width();
+//    k1_exp.SetSize(n, mem_type);
+//    k2_exp.SetSize(n, mem_type);
+//    k_imp.SetSize(n, mem_type);
+//    y.SetSize(n, mem_type);
+// }
+
+// void TopOptIMEXRK2::Step(Vector &x, real_t &t, real_t &dt)
+// {
+//    double gamma = 1 - sqrt(2)/2;
+//    double delta = 1 - 1/(2*gamma);
+
+//    f->SetTime(t);
+
+//    //K1 exp is just f_1(t, x)
+//    f->Mult(x, k1_exp);
+
+//    //K2 exp is f_1(t + gamma dt, x + dt gamma K1)
+//    f->SetTime(t + gamma*dt);
+//    add(x, dt*gamma, k1_exp, y);
+//    f->Mult(y, k2_exp);
+
+//    //K2_imp = f_2(t + gamma dt, x + dt gamma K2_imp)
+//    f->ImplicitSolve(dt*gamma, x, k_imp);
+//    //reuse k_imp to avoid extra vector
+
+//    //K3_imp = f_2(t+dt,x + dt(1-gamma)K2_imp + dt gamma K3_imp)
+//    f -> SetTime(t + dt);
+//    //add(x, dt*(1-gamma), k2_imp, z);
+//    //optimization to avoid extra vector
+//    x.Add(dt*(1-gamma), k_imp);
+//    //f->ImplicitSolve(dt*gamma, z, k3_imp);
+//    //reuse k_imp to avoid extra vector
+//    f->ImplicitSolve(dt*gamma, x, k_imp);
+
+//    //add it all up
+//    f->SetTime(t);
+//    x.Add(dt*delta, k1_exp);
+//    x.Add(dt*(1-delta), k2_exp);
+//    //x.Add(dt*(1-gamma), k2_imp); it is already added to x above
+//    x.Add(dt*gamma, k_imp);
+//    t += dt;
+// }
+
+// void TopOptIMEXRK2::AdjointStep(Vector &lam, real_t &t, real_t &dt, Vector &x)
+// {
+//    double gamma = 1 - sqrt(2)/2;
+//    double delta = 1 - 1/(2*gamma);
+//    int n = lam.Size();
+
+//    f->SetTime(t);
+
+//    Vector x1(n), x2(n), x3(n), ys(n), yi(n), x4(n);
+//    f->Mult(x, x1);
+
+//    //K2 exp is f_1(t + gamma dt, x + dt gamma K1)
+//    f->SetTime(t + gamma*dt);
+//    add(x, dt*gamma, k1_exp, ys);
+//    f->UpdateDt(gamma*dt);
+//    f->Mult(ys, x2);
+//    f->UpdateDt(dt);
+
+//    //K2_imp = f_2(t + gamma dt, x + dt gamma K2_imp)
+//    f->ImplicitSolve(dt*gamma, x, x3);
+//    //reuse k_imp to avoid extra vector
+
+//    //K3_imp = f_2(t+dt,x + dt(1-gamma)K2_imp + dt gamma K3_imp)
+//    f -> SetTime(t + dt);
+//    //add(x, dt*(1-gamma), k2_imp, z);
+//    //optimization to avoid extra vector
+//    add(x, dt*(1-gamma), x3, yi);
+//    //f->ImplicitSolve(dt*gamma, z, k3_imp);
+//    //reuse k_imp to avoid extra vector
+//    f->ImplicitSolve(dt*gamma, yi, x4);
+
+//    /////////////////////////////
+
+//    //K1 exp is just f_1(t, x)
+//    f->UpdateDt(delta*dt);
+//    f->AdjointMult(lam, k1_exp, x);
+
+//    //K2 exp is f_1(t + gamma dt, x + dt gamma K1)
+//    f->SetTime(t + gamma*dt);
+//    add(lam, dt*gamma, k1_exp, y);
+//    f->UpdateDt((1-delta)*dt);
+//    f->AdjointMult(y, k2_exp, x);
+//    // f->UpdateDt(dt);
+
+//    //K2_imp = f_2(t + gamma dt, x + dt gamma K2_imp)
+//    f->UpdateDt((1-gamma)*dt);
+//    f->AdjointImplicitSolve(dt*gamma, lam, x, k_imp);
+//    //reuse k_imp to avoid extra vector
+
+//    //K3_imp = f_2(t+dt,x + dt(1-gamma)K2_imp + dt gamma K3_imp)
+//    f -> SetTime(t + dt);
+//    //add(x, dt*(1-gamma), k2_imp, z);
+//    //optimization to avoid extra vector
+//    lam.Add(dt*(1-gamma), k_imp);
+//    //f->ImplicitSolve(dt*gamma, z, k3_imp);
+//    //reuse k_imp to avoid extra vector
+//    f->UpdateDt(gamma*dt);
+//    f->AdjointImplicitSolve(dt*(gamma), lam, yi, k_imp);
+//    f->UpdateDt(dt);
+
+//    f->SetTime(t);
+
+//    //add it all up
+//    lam.Add(dt*delta, k1_exp);
+//    lam.Add(dt*(1.0-delta), k2_exp);
+//    //x.Add(dt*(1-gamma), k2_imp); it is already added to x above
+//    lam.Add(dt*gamma, k_imp);
+//    t += dt;
+// }
 
 
-   int outer_it;
-   int vis_steps;
 
-   MPI_Comm comm;
-   int imex_integrator;
-   int problem_type;
+// std::unique_ptr<TopOptIMEXSolver> SelectDesignOptIMEX(const int ode_solver_type)
+// {
+//    using ode_ptr = std::unique_ptr<TopOptIMEXSolver>;
+//    switch (ode_solver_type)
+//    {
+//       // L-stable IMEX methods for design opt
+//       case 1: return ode_ptr(new TopOptIMEXExpImplEuler);
+//       case 2: return ode_ptr(new TopOptIMEXRK2);
 
-   public:
-   DesignSolver(ParFiniteElementSpace &state_fes_,
-                         ParFiniteElementSpace &filter_fes_,
-                         ParFiniteElementSpace &control_fes_,
-                         toopt::PDEFilter &filter_,
-                         Array<int> &ess_bdr_attr_,
-                         Array<int> &inflow_bdr_,
-                         HeatTransferObjectiveFunction &objective_,
-                         VectorFunctionCoefficient &v_base_,
-                         real_t raw_diff_term_,
-                         real_t dt_diff_term_,
-                         FunctionCoefficient &raw_inflow_,
-                         GridFunctionCoefficient &q0_,
-                         int nsteps_, real_t dt_, real_t t_final_,
-                         ParGridFunction &rho_,
-                         ParGridFunction &rho_tilde_,
-                         SIMPCoefficient &SIMP_cf_, 
-                         int imex_integrator_, int vis_steps_, int problem_type_, MPI_Comm comm_)
-      : state_fes(state_fes_), filter_fes(filter_fes_), control_fes(control_fes_),
-        filter(filter_),
-        ess_bdr_attr(ess_bdr_attr_), inflow_bdr(inflow_bdr_),
-        objective(objective_), 
-        dt_diff_term(dt_diff_term_), raw_inflow(raw_inflow_), q0(q0_), raw_diff_term(raw_diff_term_),
-        nsteps(nsteps_), dt(dt_), t_final(t_final_),
-        rho(rho_), rho_tilde(rho_tilde_), q_gf(&state_fes_), imex_integrator(imex_integrator_), v_base(v_base_), SIMP_cf(SIMP_cf_),
-        q_vec(nullptr), oper(nullptr), vis_steps(vis_steps_), problem_type(problem_type_), comm(comm_)
-   { 
-      outer_it = 0;
-   }
-
-   ~DesignSolver() 
-   { 
-      if (oper) delete oper; 
-      if (q_vec) delete q_vec;
-   }
-
-   int NumSteps() const {return nsteps;}
-   real_t Time_Step() const {return dt;}
-
-   // 1. Forward Filter. Raw control density -> filtered density (Helmholtz solve).
-   void FilterFSolve(const Vector &rho_tv)
-   {
-      rho.SetFromTrueDofs(rho_tv);
-      filter.Mult(rho, rho_tilde);
-      rho_tilde.ExchangeFaceNbrData();
-   }
-
-   // 2. Forward physics: (re)assemble the operator for the current rho_tilde_, run
-   //    the IMEX Forward Integration, store the trajectory, return J.
-   real_t PhysicsFSolve()
-   {
-      if (oper) { delete oper; oper = nullptr; }
-      if (q_vec) { delete q_vec; q_vec = nullptr; }
-      std::unique_ptr<TopOptIMEXSolver> ode_solver = SelectDesignOptIMEX(imex_integrator);
-      oper = new IMEXAdvectionDiffusionSolver(state_fes, 
-         raw_inflow, 
-         v_base, dt_diff_term, 
-         raw_diff_term, q0, 
-         rho_tilde, dt, 
-         t_final, SIMP_cf,
-         comm, inflow_bdr, ess_bdr_attr);
-      if (problem_type == 1){oper->InitializeInjectionProblem();}
-      else if (problem_type == 2){oper->InitializeFlowProblem();}
-      else{MFEM_ABORT("Unknown Problem Type: " << problem_type );}
-      objective.Reset();
-
-      q_gf = oper->Getq();
-      // q_gf.ExchangeFaceNbrData();
-      q_vec = q_gf.GetTrueDofs();
-      real_t acc = objective.AccumulateTimestep(q_gf, dt, 0, nsteps);
-      ParaViewDataCollection *pd = NULL;
-      if (paraview_vis)
-      {
-         pd = new ParaViewDataCollection("forward", state_fes.GetParMesh());
-         pd->SetPrefixPath("ParaView");
-         pd->RegisterField("solution", &q_gf);
-         pd->SetLevelsOfDetail(state_fes.GetOrder(0));
-         pd->SetDataFormat(VTKFormat::BINARY);
-         pd->SetHighOrderOutput(false);
-         pd->SetCycle(0);
-         pd->SetTime(0.0);
-         pd->Save();
-      }
-      real_t t = 0.0;
-      times.resize(nsteps);
-      ode_solver->Init(*oper);
-      oper->SetTime(t);
-      bool done = false;
-      int myrank;
-      MPI_Comm_rank(comm, &myrank);
-      // std::cout << "my_rank = " << myrank << "time step initial " << ", time: 0 " << ", ||q|| = " << q_vec->Norml2() << std::endl;
-      for (int ti = 0; !done; )
-      {
-         real_t dt_real = std::min(dt, t_final - t);  
-         oper->UpdateDt(dt_real);
-         times[ti] = dt_real;
-         ode_solver->Step(*q_vec, t, dt_real);
-         q_gf.SetFromTrueDofs(*q_vec);
-         acc = objective.AccumulateTimestep(q_gf, dt_real, ti, nsteps);
-         // real_t current_obj = objective.GetObjective();
-         // std::cout << "contribution = " << acc << " objective so far = " << current_obj << " contrib check = " << current_obj - acc << std::endl;
-         // std::cout << "my_rank = " << myrank << "time step: " << ti << ", time: " << t << ", ||q|| = " << q_vec->Norml2() << std::endl;
-         ti++;
-         oper->SetStep(ti);
-         oper->StoreTraj(ti, *q_vec);
-         oper->SetTime(t);
-         done = (t >= t_final - 1e-8*dt); 
-         if (done || ti % vis_steps == 0)
-         {
-         q_gf.SetFromTrueDofs(*q_vec);
-         if (paraview_vis)
-         {
-            pd->SetCycle(ti);
-            pd->SetTime(t);
-            pd->Save();
-         }
-         }
-      }
-      q_gf.SetFromTrueDofs(*q_vec);
-      oper->Updateq(q_gf);
-      //acc = objective.AccumulateTimestep(q_gf, dt, nsteps-1, nsteps);
-      // objective.ComputeObjective(q_gf);
-      return objective.GetObjective();
-   }
-
-   // 3. Adjoint physics: backward discrete-adjoint sweep -> dJ/d(rho_tilde).
-   void PhysicsASolve()
-   {
-      std::unique_ptr<TopOptIMEXSolver> ode_solver = SelectDesignOptIMEX(imex_integrator);
-      MFEM_VERIFY(oper, "PhysicsASolve() requires a preceding PhysicsFSolve().");
-      const int myid = Mpi::WorldRank();
-      ParGridFunction lam_gf(&state_fes);
-      ParLinearForm grad_form(&state_fes);
-      objective.ComputeObjectiveGradient(q_gf, times[nsteps-1], nsteps-1, nsteps,grad_form);
-      HypreParVector* grad_vec = grad_form.ParallelAssemble();
-
-      // 3. Set the primal GridFunction from the True-Dofs
-      HypreParVector lam_vec = *grad_vec;
-      lam_vec *= -1.0;
-      lam_gf.SetFromTrueDofs(lam_vec);
-      oper->SetStep(nsteps);
-      oper->TakeAdjoint();
-      ode_solver->Init(*oper);
-      ParaViewDataCollection *pd_adj = NULL;
-      if (paraview_vis)
-      {
-         pd_adj = new ParaViewDataCollection("adjoint", state_fes.GetParMesh());
-         pd_adj->SetPrefixPath("ParaView");
-         pd_adj->RegisterField("solution", &lam_gf);
-         pd_adj->SetLevelsOfDetail(state_fes.GetOrder(0));
-         pd_adj->SetDataFormat(VTKFormat::BINARY);
-         pd_adj->SetHighOrderOutput(false); 
-         pd_adj->SetCycle(0);
-         pd_adj->SetTime(t_final);
-         pd_adj->Save();
-      } 
-      real_t t = t_final;
-      bool done = false;
-      for (int ti = 0; !done;)
-      {
-         real_t dti = times[nsteps-ti-1]; 
-         oper->UpdateDt(dti);
-         real_t t_dummy = t;
-         oper->GetTraj(oper->GetStep() - 1, *q_vec);
-         q_gf.SetFromTrueDofs(*q_vec);
-         ode_solver->AdjointStep(lam_vec, t_dummy, dti, *q_vec);
-         ParLinearForm grad_form2(&state_fes);
-         objective.ComputeObjectiveGradient(q_gf, times[nsteps-ti-2], nsteps - ti - 2, nsteps, grad_form2);
-         grad_vec = grad_form2.ParallelAssemble();
-         lam_vec.Add(-1.0, *grad_vec);
-         ti++;
-         oper->SetStep(nsteps-ti);
-         t -= dti;
-         oper->SetTime(t);
-         done = (t <= 1e-8*dt); 
-         if (done || ti % vis_steps == 0)
-         {
-            if (Mpi::Root())
-            {
-               // std::cout << "time step: " << ti << ", time: " << t << ", dt = " << dti << std::endl;  
-            }
-            // lam_gf = *lambda;
-            lam_gf.SetFromTrueDofs(lam_vec);
-            if (paraview_vis)
-            {
-               pd_adj->SetCycle(ti);
-               pd_adj->SetTime(t_final-t);
-               pd_adj->Save();
-            }
-         }
-      }
-      dJ_drho_tilde = oper->GetDesignGrad();
-      delete grad_vec;
-   } 
-
-   // 4. Adjoint filter: transpose the filter, dJ/d(rho_tilde) -> dJ/d(rho).
-   void FilterASolve(Vector &dJ_drho)
-   {
-      filter.MultTranspose(dJ_drho_tilde, dJ_drho);
-      MFEM_VERIFY(dJ_drho.Size() == control_fes.GetTrueVSize(),
-                  "Raw design gradient has unexpected size.");
-
-   }
-
-   // Convenience: the four steps in sequence (forward filter + physics, adjoint
-   // physics + filter). Returns J and fills dJ_drho.
-   real_t ObjectiveAndGradient(const Vector &rho_tv, Vector &dJ_drho,
-                               int outer_it = -1)
-   {
-      // FilterFSolve(rho_tv);
-      // const real_t J = PhysicsFSolve();
-      // PhysicsASolve();
-      // FilterASolve(dJ_drho);
-      const real_t J = 0.0;
-      std::cout << "Not implemented " << std::endl;
-      return J;
-   }
-
-   // Forward-only objective J(rho) (no gradient / no stored trajectory).
-   real_t Objective(const Vector &rho_tv)
-   {
-      return 0.0;
-      // return EvaluateDesignObjective(
-      //           rho_tv, x0_, state_fes_, control_fes_, rho_, rho_tilde_, filter_,
-      //           gamma_coef_, exterior_bdr_attr_, ess_bdr_attr_, objective_, mat_,
-      //           load_spec_, load_coef_, impedance_, nsteps_, h_, mass_type_);
-   }
-};
+//       default: MFEM_ABORT("Unknown ODE solver type: " << ode_solver_type );
+//    }
+// }
 }
 #endif 

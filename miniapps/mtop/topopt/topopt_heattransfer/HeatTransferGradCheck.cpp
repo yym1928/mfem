@@ -1,8 +1,5 @@
 #include "mfem.hpp"
-#include "HeatTransferTopOpt.hpp"
-#include "ObjFunc.hpp"
-#include "HeatTransferSolvers.hpp"
-#include "HeatTransferLinForms.hpp"
+#include "TopOptDesignSolvers.hpp"
 #include "../../mma/MMA_MFEM.hpp"
 #include "../../pde_filter.hpp"
 #include "../../mtop_solvers.hpp"
@@ -17,8 +14,8 @@ void velocity_function(const Vector &x, Vector &v)
 {
    int dim = x.Size();
    v(0) = 0.0;
-   v(1) = 1.0; 
-}
+   v(1) = 1.0;   
+} 
 
 real_t q0_function(const Vector &x)
 {
@@ -63,7 +60,7 @@ int main(int argc, char *argv[])
    Mpi::Init();  
    int num_procs = Mpi::WorldSize();   
    const MPI_Comm comm = MPI_COMM_WORLD;     
-   int myid = Mpi::WorldRank();          
+   int myid = Mpi::WorldRank();                  
    Hypre::Init();  
 
    // 2. Parse command-line options.
@@ -74,10 +71,10 @@ int main(int argc, char *argv[])
    bool pv_vis = false; 
    int ode_solver_type = 1; // 1 - Forward Backward Euler  
    real_t t_final = 0.1;         
-   real_t dt = 0.01; 
+   real_t dt = 0.01;             
    real_t diffusion_term = 0.1;   
-   int problem_type = 1; 
-   int vis_steps = 10;  
+   int problem_type = 2; 
+   int vis_steps = 10;                   
    const char *device_config = "cpu";  
  
    OptionsParser args(argc, argv); 
@@ -89,7 +86,7 @@ int main(int argc, char *argv[])
    args.AddOption(&par_ref_levels, "-rp", "--refine-parallel",  
                     "Number of times to refine the mesh uniformly in parallel.");       
    args.AddOption(&order, "-o", "--order",
-                    "Finite element order (polynomial degree) >= 0.");   
+                    "Finite element order (polynomial degree) >= 0.");       
    args.AddOption(&pv_vis, "-vis", "--visualization", "-no-vis",  
                     "--no-visualization", 
                     "Enable or disable Paraview Visualization");
@@ -148,7 +145,7 @@ int main(int argc, char *argv[])
    // 6. Define the discontinuous DG finite element space of the given
    //    polynomial order on the refined mesh.
    FiniteElementCollection *fec = new DG_FECollection(order, dim, BasisType::GaussLobatto);
-   ParFiniteElementSpace *fes = new ParFiniteElementSpace(pmesh, fec);
+   ParFiniteElementSpace *fes = new ParFiniteElementSpace(pmesh, fec);                                                    
    HYPRE_BigInt global_vSize = fes->GlobalTrueVSize(); 
  
    H1_FECollection filter_fec(order, dim); 
@@ -165,7 +162,7 @@ int main(int argc, char *argv[])
    { 
       if (myid == 0)
       {
-         cerr << "Error: unknown -init value. Use uniform, solid, void, or gaussian.\n"; 
+         cerr << "Error: unknown -init value. Use uniform, solid, void, or gaussian.\n";        
       }
       return 1;
    } 
@@ -202,16 +199,16 @@ int main(int argc, char *argv[])
    FunctionCoefficient inflow(inflow_function);   
    FunctionCoefficient q0(q0_function); 
    real_t dt_diffusion_term = dt*diffusion_term; 
- 
-   // 11. Construct the Objective Function
+   
+   // 11. Construct the Objective Function 
    RectangularIndicator indicator(0, 1, 0, 1); 
    ParGridFunction one_gf(fes);
    ConstantCoefficient one_cf(1.0);
-   one_gf.ProjectCoefficient(one_cf);
-   TimeIntegratedL2TargetObjective obj_func(fes, indicator, one_gf, comm);           
+   one_gf.ProjectCoefficient(one_cf);     
+   TerminalTargetObjective obj_func(fes, indicator, one_gf, comm);           
    int n_steps = (int)ceil(t_final / dt);   
   
-   const int n = control_fes.GetTrueVSize();
+   const int n = control_fes.GetTrueVSize();      
    Vector rho_tv(n);
    rho.GetTrueDofs(rho_tv);
    double worst_best_fd_rel = 0.0; 
@@ -235,11 +232,11 @@ int main(int argc, char *argv[])
       q0_gf.SetFromTrueDofs(q0_vec); 
       GridFunctionCoefficient q0_cf; 
       q0_cf.SetGridFunction(&q0_gf);
-      DesignSolver design_solver(*fes, 
+      DesignSolver design_solver(*fes,               
          filter_fes,  
          control_fes, 
          filter, 
-         ess_bdr, 
+         ess_bdr,  
          inflow_bdr, 
          obj_func,
          raw_velocity, 
@@ -260,16 +257,16 @@ int main(int argc, char *argv[])
       design_solver.FilterASolve(dJ_drho);
       
       const real_t projected_grad = InnerProduct(comm, h, dJ_drho);     
-      real_t gradnorm = sqrt(InnerProduct(comm,dJ_drho, dJ_drho));  
+      real_t gradnorm = sqrt(InnerProduct(comm, dJ_drho, dJ_drho));  
 
       if (Mpi::Root())
       {
          mfem::out << "\nDesign Taylor trial " << trial   
-                   << ": J0=" << setprecision(16) << J0
+                   << ": J0=" << setprecision(16) << J0 
                    << ", <dJ/drho,p>=" << projected_grad   
                    << ", ||dJ/drho||="<< gradnorm << '\n';   
       }
-
+ 
 
       real_t scale = 1.0;  
       double previous_remainder = -1.0;  
