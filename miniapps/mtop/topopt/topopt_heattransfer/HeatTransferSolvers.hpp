@@ -232,7 +232,7 @@ class IMEXAdvectionDiffusionSolver : public TimeDependentOperator
     void ImplicitSolve2(const real_t dt, const Vector &x, Vector &k);
     void JacobianMult1Transpose(const Vector &lam, Vector &lam_rhs) const;
     void ExplicitMultDesignGradient(const real_t dt, Vector &dual_vector, Vector &x, Vector &dgdrho_tilde);
-    void ImplicitSolveDesignGradient(const real_t dt, Vector &dual_vector, Vector &x, Vector &dfdrho_tilde); 
+    void ImplicitSolveDesignGradient(const real_t dt_pass, const real_t a, Vector &dual_vector, Vector &x, Vector &dfdrho_tilde); 
     void AdjointImplicitSolve2(const real_t dt, const Vector &lam, Vector &k);
     void Mult(const Vector &x, Vector &y) const override
     {
@@ -561,13 +561,13 @@ void IMEXAdvectionDiffusionSolver::AdjointImplicitSolve2(const real_t dt_pass, c
    S_mat->Mult(z, k);
 }
 
-void IMEXAdvectionDiffusionSolver::ImplicitSolveDesignGradient(const real_t dt,Vector &dual_vector, Vector &x, Vector &dfdrho_tilde)
+void IMEXAdvectionDiffusionSolver::ImplicitSolveDesignGradient(const real_t dt_pass, const real_t a,Vector &dual_vector, Vector &x, Vector &dfdrho_tilde)
 {
    MFEM_VERIFY(implicit_solver != NULL, "Implicit time integration is not supported with partial assembly");
    implicit_solver->SetTimeStep(dt);
    if (problem_type == 1)
    {
-      dfdrho_tilde = 0.0;
+      //dfdrho_tilde = 0.0;
       // No dependence on rho, do nothing.
    }
    else if (problem_type == 2)
@@ -592,7 +592,7 @@ void IMEXAdvectionDiffusionSolver::ImplicitSolveDesignGradient(const real_t dt,V
       stiff_lf1.AddInteriorFaceIntegrator(new DGStiffnessDesignLFIntegrator(rho_tilde, y_gf, w_gf, raw_diff_term, kappa, SIMP_cf));
       stiff_lf1.Assemble();
       std::unique_ptr<HypreParVector> stiff_vec1(stiff_lf1.ParallelAssemble());    
-      dfdrho_tilde.Add(1.0, *stiff_vec1);
+      dfdrho_tilde.Add(a, *stiff_vec1);
       // design_gradient.Add(dt, *stiff_vec1); 
    }
    else{MFEM_ABORT("Unknown Problem Type (Design Gradient): " << problem_type);}

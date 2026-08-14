@@ -90,7 +90,7 @@ int main(int argc, char *argv[])
    args.AddOption(&pv_vis, "-vis", "--visualization", "-no-vis",  
                     "--no-visualization", 
                     "Enable or disable Paraview Visualization");
-   args.AddOption(&ode_solver_type, "-s", "--ode-solver",
+   args.AddOption(&ode_solver_type, "-s", "--ode-solver",                                        
                     ODESolver::IMEXTypes.c_str()); 
    args.AddOption(&t_final, "-tf", "--t-final",   
                     "Final time; start time is 0.");   
@@ -254,8 +254,8 @@ int main(int argc, char *argv[])
       design_solver.FilterFSolve(rho_tv);              // forward filter:  rho -> rho_tilde
       const real_t J0 = design_solver.PhysicsFSolve(); // forward physics: -> J
       design_solver.PhysicsASolve();                      // adjoint physics: -> dJ/drho_tilde 
-      design_solver.FilterASolve(dJ_drho);
-      
+      design_solver.FilterASolve(dJ_drho);   
+       
       const real_t projected_grad = InnerProduct(comm, h, dJ_drho);     
       real_t gradnorm = sqrt(InnerProduct(comm, dJ_drho, dJ_drho));  
 

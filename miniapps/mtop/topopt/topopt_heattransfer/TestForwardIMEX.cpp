@@ -541,8 +541,6 @@ int main(int argc, char *argv[])
       }
    }
 
-   ode_solver->AdjointStep(*U, *U, t, dt);  
-
    // 11. Free the used memory.
    delete pd;
    delete U;
