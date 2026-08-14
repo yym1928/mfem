@@ -474,7 +474,13 @@ public:
    void GetFromVector(int offset, const Vector &v);
    /** If (dofs[i] < 0 and dofs[j] >= 0) or (dofs[i] >= 0 and dofs[j] < 0)
        then (*this)(i,j) = -(*this)(i,j).  */
-   void AdjustDofDirection(Array<int> &dofs);
+   void AdjustDofDirection(const Array<int> &dofs);
+
+   /** If (row_dofs[i] < 0) xor (col_dofs[j] < 0) then
+    (*this)(i,j) = -(*this)(i,j). This method also converts
+    row_dofs/col_dofs to unsigned indices (d -> -d-1). */
+   void AdjustDofDirection(Array<int> &row_dofs,
+                           Array<int> &col_dofs);
 
    /// Replace small entries, abs(a_ij) <= eps, with zero.
    void Threshold(real_t eps);
@@ -1130,6 +1136,17 @@ private:
 public:
    DenseTensor() : ni(0), nj(0), nk(0) { }
 
+   DenseTensor(const DenseTensor &other)
+      : tdata(other.tdata), ni(other.ni), nj(other.nj), nk(other.nk) { }
+
+   DenseTensor(DenseTensor &&other)
+      : tdata(std::move(other.tdata)), ni(other.ni), nj(other.nj), nk(other.nk)
+   {
+      // Reset other; other.tdata is reset in Array<T> move constructror.
+      other.Mk.ClearExternalData();
+      other.ni = other.nj = other.nk = 0;
+   }
+
    DenseTensor(int i, int j, int k) : tdata(i*j*k), ni(i), nj(j), nk(k) { }
 
    DenseTensor(real_t *d, int i, int j, int k)
@@ -1137,6 +1154,33 @@ public:
 
    DenseTensor(int i, int j, int k, MemoryType mt)
       : tdata(i*j*k, mt), ni(i), nj(j), nk(k) { }
+
+   DenseTensor &operator=(const DenseTensor &other)
+   {
+      if (this == &other) { return *this; }
+      Mk.ClearExternalData();
+      tdata = other.tdata;
+      ni = other.ni;
+      nj = other.nj;
+      nk = other.nk;
+      return *this;
+   }
+
+   DenseTensor &operator=(DenseTensor &&other)
+   {
+      if (this == &other) { return *this; }
+      Mk.ClearExternalData();
+      tdata = std::move(other.tdata);
+      ni = other.ni;
+      nj = other.nj;
+      nk = other.nk;
+
+      // Reset other; other.tdata is reset in Array<T> move assignment.
+      other.Mk.ClearExternalData();
+      other.ni = other.nj = other.nk = 0;
+
+      return *this;
+   }
 
    int SizeI() const { return ni; }
    int SizeJ() const { return nj; }
